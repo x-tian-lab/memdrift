@@ -406,6 +406,156 @@ def blame(obj: dict, page: str, as_json: bool) -> None:
 
 
 @main.command()
+@click.option("--since", default=None, help="Window, e.g. 1d / 36h / 2026-11-20.")
+@click.option("--until", default=None, help="Upper bound, same formats as --since.")
+@click.option("--page", default=None, help="Only this path.")
+@click.option("-o", "--out", default=None, help="Output file (default: memdrift-digest-<date>.html).")
+@click.option("--title", default=None, help="Heading of the generated page.")
+@click.option(
+    "--no-quote",
+    is_flag=True,
+    help="Drop verbatim evidence quotes (keeps the reference, hides the text).",
+)
+@click.option(
+    "--no-redact",
+    is_flag=True,
+    help="DANGER: keep absolute paths. Only for a digest that never leaves this machine.",
+)
+@click.pass_obj
+def digest(
+    obj: dict,
+    since: str | None,
+    until: str | None,
+    page: str | None,
+    out: str | None,
+    title: str | None,
+    no_quote: bool,
+    no_redact: bool,
+) -> None:
+    """Write a single self-contained HTML report you can send to someone."""
+    from . import digest as digest_mod
+    from . import events as events_mod
+    from .security import Redactor
+
+    repo = _open(obj["directory"])
+    if no_redact:
+        click.secho(
+            "warning: --no-redact keeps absolute paths and usernames in the output. "
+            "Do not send this file to anyone.",
+            fg="red",
+            err=True,
+        )
+    redactor = Redactor(root=str(repo.root), keep_quotes=not no_quote)
+    if no_redact:
+        redactor.root = None
+    try:
+        stream = events_mod.build(repo, since=since, until=until, page=page, redactor=redactor)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    target = Path(out) if out else Path.cwd() / digest_mod.default_filename()
+    digest_mod.write_digest(
+        stream,
+        target,
+        title=title or f"memdrift · {repo.root.name}",
+    )
+    risky = len(stream.risky)
+    pending = len(events_mod.working_tree(repo))
+    click.echo(
+        f"{click.style('wrote', fg='green')} {target}  "
+        + click.style(
+            f"{stream.commits} commit(s) · {len(stream.events)} field change(s)", fg="black", dim=True
+        )
+    )
+    if risky:
+        click.echo(
+            "  "
+            + click.style(f"{risky} change(s) need review", fg="red")
+            + click.style(" — deletes or wholesale rewrites", fg="black", dim=True)
+        )
+    elif stream.events:
+        click.echo("  " + click.style("nothing destructive in this window", fg="black", dim=True))
+    if pending:
+        click.echo(
+            "  " + click.style(f"{pending} uncommitted change(s) not included", fg="yellow")
+        )
+    if stream.hidden:
+        click.echo(
+            click.style(
+                f"  {len(stream.hidden)} private page(s) excluded, with their evidence",
+                fg="black",
+                dim=True,
+            )
+        )
+
+
+@main.command()
+@click.option("--port", type=int, default=7787, help="Port on 127.0.0.1.")
+@click.option("--host", default="127.0.0.1", show_default=True, help="Loopback only.")
+@click.option("--open", "open_browser", is_flag=True, help="Open the URL in a browser.")
+@click.option("--verbose", is_flag=True, help="Log each request.")
+@click.pass_obj
+def serve(obj: dict, port: int, host: str, open_browser: bool, verbose: bool) -> None:
+    """Serve a read-only local UI (loopback only, token in the URL)."""
+    import threading
+    import webbrowser
+
+    from . import server as server_mod
+
+    repo = _open(obj["directory"])
+    if port == 0:
+        port = 7787
+    try:
+        server_mod.check_host(host)
+    except server_mod.LoopbackOnly as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    ready = threading.Event()
+    holder: dict = {}
+
+    def run() -> None:
+        try:
+            srv = server_mod.make_server(repo, host=host, port=port, verbose=verbose)
+        except OSError as exc:
+            holder["error"] = exc
+            ready.set()
+            return
+        holder["server"] = srv
+        ready.set()
+        try:
+            srv.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            srv.server_close()
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    ready.wait(5)
+
+    if "error" in holder:
+        raise click.ClickException(f"cannot listen on {host}:{port}: {holder['error']}")
+
+    srv = holder["server"]
+    url = server_mod.url_for(srv)
+    click.echo(f"{click.style('serving', fg='green')} {url}")
+    click.echo(
+        click.style(
+            "  loopback only · the token in the URL is required · Ctrl+C to stop",
+            fg="black",
+            dim=True,
+        )
+    )
+    if open_browser:
+        webbrowser.open(url)
+    try:
+        while thread.is_alive():
+            thread.join(0.5)
+    except KeyboardInterrupt:
+        srv.shutdown()
+
+
+@main.command()
 @click.option("--json", "as_json", is_flag=True)
 @click.pass_obj
 def status(obj: dict, as_json: bool) -> None:

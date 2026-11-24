@@ -61,9 +61,26 @@ A layer that sits **beside** your memory directory and only records how it chang
 | Fact extraction | Hindsight / mem0 | not our job |
 | Storage & retrieval | basic-memory / iwe / any vault | **untouched** |
 | Change history | — | **here** |
-| Presentation | your product's UI | CLI today, digest + MCP next |
+| Presentation | your product's UI | CLI, digest HTML, local UI |
 
 **Not** a memory system, not a vector store, not a wiki editor, not a replacement for git.
+
+### Where you actually look at it
+
+A terminal is a bad place to read your own biography. Two views, one data source:
+
+**`memdrift digest`** writes a single `.html` — inline CSS, no fonts to download, no analytics, no `http://` anywhere. Double-click it, or mail it. It is safe to send because sending it is *the point*:
+
+![memdrift digest writing ~/vault/digest.html: 2 commits, 10 field changes, nothing destructive](docs/assets/08-digest.png)
+
+**`memdrift serve`** opens a read-only local UI when you want to dig around instead of read a report.
+
+```bash
+memdrift -C ~/vault digest --since 1d -o morning.html
+memdrift -C ~/vault serve --open
+```
+
+Both read the same redacted event stream, so they cannot disagree, and neither can forget to redact.
 
 ## Quickstart
 
@@ -104,9 +121,28 @@ It is the only reason to point a tool at a directory you care about, so it is th
 | `memdrift -C <dir> show [commit]` | What one commit changed, with its evidence |
 | `memdrift -C <dir> blame <page>` | Per-field: which commit last changed it, with evidence |
 | `memdrift -C <dir> status` | Uncommitted changes |
+| `memdrift -C <dir> digest [--since 1d] [--no-quote] [-o file]` | Self-contained HTML report, redacted by default |
+| `memdrift -C <dir> serve [--port 7787] [--open]` | Read-only local UI on 127.0.0.1, token in the URL |
 | `memdrift -C <dir> index --rebuild` | Rebuild the SQLite index from commit files |
 
 Add `--json` to `log`, `diff`, `show`, `blame`, `status`, `commit` for machine output.
+
+## Sharing it without leaking it
+
+A memory directory is a biography. The moment you paste a digest into a group chat you have published it, so the defaults are built around that:
+
+| Risk | Default behaviour |
+|---|---|
+| **Machine paths** | `C:\Users\alice\vault\a.md` → `a.md`. The root is stripped everywhere: change lists, evidence refs, page titles. |
+| **Verbatim quotes** | Truncated to 120 chars with a `…`. `--no-quote` keeps the reference (`email:msg-1882`) and drops the text. |
+| **Private pages** | `private: true` in frontmatter removes the page *and every evidence entry pointing at it* — otherwise the leak just moves one hop. |
+| **Escaping** | All memory text is HTML-escaped; a page whose title is `<script>` renders as text. |
+| **`serve` binding** | Loopback only. `--host 0.0.0.0` is refused by design, not by config. |
+| **CSRF** | A per-process random token in the URL; requests without it get 403, so another site cannot read your history via `localhost`. |
+
+`--no-redact` exists and prints a warning. Use it only for a file that never leaves the machine.
+
+What is **not** encrypted: `.memgit/` objects are zlib-compressed, not encrypted. Anyone who can read the directory can read the history. If that is your threat model, put the directory on an encrypted volume — pretending to invent a key-management scheme here would be worse.
 
 ## How a change is stored
 
@@ -160,13 +196,14 @@ git clone git@github.com:x-tian-lab/memdrift.git && cd memdrift
 python -m venv .venv && .venv/bin/pip install -e ".[docs]"
 .venv/bin/pytest -q
 .venv/bin/python scripts/render_terminal_shots.py   # regenerates docs/assets
+.venv/bin/python scripts/smoke_serve.py             # drives serve over real HTTP
 ```
 
 Every screenshot in this README is produced by that last command: it builds a demo vault, runs the real binary, and fails loudly if any command does. There is no hand-edited output anywhere in the images.
 
 ## Status
 
-v0.1, week 1 of the plan: `init · watch · commit · log · diff · show · blame · status` work on a real directory. `revert`, the daily digest HTML and the MCP server are next. Nothing here is stable enough to embed yet.
+v0.1, week 2 of the plan: `init · watch · commit · log · diff · show · blame · status · digest · serve` work on a real directory. `revert` and the MCP server are next. Nothing here is stable enough to embed yet.
 
 Requirements: Python 3.11+, macOS / Linux / Windows. Three dependencies: `click`, `python-frontmatter`, `watchdog` (and `jinja2`, once the digest lands).
 

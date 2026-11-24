@@ -78,20 +78,73 @@ SQLite 只是缓存，不是真相。`ops.log()` 每次先检查 `index.has_comm
 | `git diff` 式 `diff <a> <b>` | 三态 + 独立的 `show`：`diff` 无参 = 工作区 vs HEAD，`diff <commit>` = 工作区 vs 该 commit（git 语义），`diff <a> <b>` = 两快照；`show <commit>` 看单次提交改了什么 | 单参数若表示「该 commit 的变更」会和 `git diff HEAD` 的肌肉记忆打架；分开命名两边都不别扭 |
 | `confidence` 缺失视为 1.0 | 存 `null`，展示时按 1.0 处理 | 存 null 保留「没声明」和「声明为 1.0」的区别，日报要区分 |
 
-## 9. W1 未做（下一步）
+## 9. 显示层（W2）
+
+### 9.1 一根管道，两个出口
+
+```
+repo ──► events.build() ──► EventStream ──┬──► digest.render_digest()  → 单文件 html
+                                          └──► server._Handler          → 本地页面
+```
+
+`digest` 和 `serve` 都不碰 `repo`，只吃 `EventStream`。这不是为了少写代码，是为了**保证两个视图不会说不同的话**。如果各自去读 commit json，迟早有一边漏了 rename，或者忘了加 `low_precision`。
+
+### 9.2 脱敏做在事件层，不是渲染层
+
+`security.Redactor` 在 `events.build()` 里就作用完了：路径、引文、private 页面都在进入渲染器之前处理掉。渲染器拿到的数据里**根本没有**本机绝对路径，所以它不可能泄漏。测试断言的是「HTML 里不含 root 字符串」，不是「HTML 里调用了 redact」。
+
+私密页面的处理多走一步：`private: true` 的页面，它的路径从 `pages`、`events` 两处都剔除；**指向它的 evidence 也一并剔除**。否则页面藏起来了，`why: email:msg-private` 还在，等于换个位置漏。
+
+### 9.3 risk 判定为什么收窄
+
+第一版把「commit 的 confidence 低于阈值」也算进每条 change 的 risk，结果一次不确定的夜间整理让 10 条全部变红。**到处都是红，等于没有红。**
+
+现在的规则：
+
+| 条件 | 是否标红 | 理由 |
+|---|---|---|
+| `op == delete` | 是 | 内容真的没了 |
+| `change_ratio >= 0.5` | 是 | 整页重写，字段归属开始不可信 |
+| `op == add` | 否 | 纯增量，没有东西被覆盖 |
+| commit confidence 低 | **否**，改成提交级一条提示 | 不确定性属于整次运行，不属于某个字段 |
+
+低置信度在 UI 上是提交卡头上的一个灰标 `agent unsure · confidence 0.42`，不污染每一行。
+
+### 9.4 serve 只绑回环
+
+`check_host()` 白名单只有 `127.0.0.1 / localhost / ::1`，**没有 `--allow-public` 之类的开关**。理由：
+
+- 记忆目录是一份传记，把它挂到局域网上不该是一个参数就能做到的事。
+- 没有账号体系。补一套账号体系会反过来暗示「这个端点本来就该被外面访问」——那是错的方向。
+- 要给别人看，就 `digest` 导出文件。**分享是显式动作，不是默认可达。**
+
+同一个前提下，浏览器仍算敌对环境：别的网站可以朝 `localhost` 发请求。所以每个进程随机生成 token 放进 URL，缺 token 一律 403，响应带 `default-src 'none'` 的 CSP。测试里 `0.0.0.0`、`::`、`192.168.x`、域名五种都会被拒。
+
+### 9.5 digest 为什么是单文件
+
+不带 `<link>`、不带 `<img src>`、不带 webfont。理由不是洁癖：**一个你会转发出去的文件，一旦请求外部资源，就等于把你的客户名单报给了第三方**（字体 CDN、分析脚本、图片托管任一条都够）。
+
+所以 CSS 内联、JS 内联、字体用系统栈。生成脚本里有一条硬检查：产物含 `http://` 或 `https://` 就直接退出。
+
+### 9.6 加密：明确不做
+
+`.memgit/objects` 是 zlib，**不是加密**。这一点在 README 里写在明处，而不是留给人自己发现。
+
+不做的理由：加密要引入密钥管理（放哪、怎么轮换、丢了怎么办），而这一层的价值在于「可读的历史」。半吊子的加密比诚实的不加密更危险——它给人虚假的安全感。真需要，就把目录放到加密卷上，那是操作系统已经解决的问题。
+
+## 11. 还没做（下一步）
 
 - `revert`：反向 commit，不 rewrite 历史。
-- `digest`：日报 HTML（内联 CSS，单文件）。
 - MCP server：stdio，`memory_digest / memory_blame / memory_revert / memory_history`。
 - 规则引擎、多目录聚合、跨系统冲突（v1.1）。
 - 路径级 `--exclude` 的 glob 语义目前是简化实现（`**/name/**` 按目录名匹配），够覆盖 `node_modules` 这类场景，不追求完整 gitignore 语法。
 
-## 10. 截图是跑出来的，不是画的
+## 12. 截图是跑出来的，不是画的
 
-README 的七张图由 `scripts/render_terminal_shots.py` 生成，流程是：
+README 的八张图由 `scripts/render_terminal_shots.py` 生成，流程是：
 
 1. `make_demo_vault.py` 重建一个干净的演示 vault（5 个 md，内容对应 PRD 的 Acme 案例）；
-2. 用真实的 `memdrift` 可执行文件跑 `init / status / commit / log / blame / show / diff / watch`；
+2. 用真实的 `memdrift` 可执行文件跑 `init / status / commit / log / blame / show / diff / digest / watch`；
 3. 捕获 stdout（`CLICOLOR_FORCE=1` 保留 click 的 ANSI 颜色），解析成带颜色的 span；
 4. 用 Pillow 画成终端窗口，逐字形做中英文回退（Cascadia Mono 没有中文，落到微软雅黑）。
 
@@ -99,6 +152,7 @@ README 的七张图由 `scripts/render_terminal_shots.py` 生成，流程是：
 
 - **任何命令失败，脚本直接退出**，不允许画一张"好看但没跑通"的图。
 - watch 那张是**真启动进程**再改三个文件，`committed` 字样来自进程真实输出；没有就当失败。
+- digest 那张要求文件真的落盘，且产物不含 root 路径、不含任何 URL，否则脚本退出。
 - 绝对路径会被替换成 `~/vault`，截图里不出现本机目录。
 - 最后一步删掉 `.memgit` 并对比 acme.md 的 sha256，把「历史可删、内容不丢」这张底牌做成可见证据。
 

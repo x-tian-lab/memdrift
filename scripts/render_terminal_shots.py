@@ -451,6 +451,31 @@ def main() -> None:
         title="memdrift — uncommitted, field by field",
     )
 
+    # digest: a real file, really written, from the same vault
+    digest_out = run(
+        [
+            str(memdrift), "-C", str(vault), "digest",
+            "--since", "7d",
+            "--title", "memdrift · nightly consolidation",
+            "-o", str(vault / "digest.html"),
+        ],
+        cwd=repo_root,
+    )
+    digest_html = vault / "digest.html"
+    if not digest_html.exists():
+        raise SystemExit("digest did not produce a file")
+    html = digest_html.read_text(encoding="utf-8")
+    for needle in (str(vault), str(vault).replace("\\", "/")):
+        if needle in html:
+            raise SystemExit("digest leaked an absolute path")
+    if "http://" in html or "https://" in html:
+        raise SystemExit("digest is not self-contained (contains a URL)")
+    render(
+        [("memdrift -C ~/vault digest --since 7d", redact(digest_out, vault))],
+        assets / "08-digest.png",
+        title="memdrift — one file, safe to send",
+    )
+
     # watch: run it for real, poke three files inside one debounce window
     watch_out = capture_watch(memdrift, vault, repo_root)
     render(

@@ -33,3 +33,8 @@ secrets.yaml
 
 # memdrift stores its own history inside the memory dir it watches;
 # this repo is the tool, not a memory dir, so nothing to ignore there.
+
+# generated digests (contain whatever was in your memory)
+memdrift-digest-*.html
+*.digest.html
+serve-url.txt
