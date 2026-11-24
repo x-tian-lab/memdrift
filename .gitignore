@@ -1,0 +1,35 @@
+# --- python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# --- tooling ---
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# --- os ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- local run artefacts ---
+*.log
+demo-vault/
+
+# --- never commit credentials ---
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+secrets.yaml
+
+# memdrift stores its own history inside the memory dir it watches;
+# this repo is the tool, not a memory dir, so nothing to ignore there.
