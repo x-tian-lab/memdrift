@@ -105,13 +105,19 @@ class ParsedPage:
         return list(self.sections)
 
     def field_text(self, dotted: str) -> str | None:
-        """Human-readable value for a field path, used by diff output."""
+        """Human-readable value for a field path, used by diff output.
+
+        Accepts the change-record spelling (``frontmatter.pricing``) as well as
+        the bare flattened key (``pricing``); ``fields`` itself holds the bare
+        form, so the prefix has to come off before the lookup.
+        """
         if dotted.startswith("section:"):
             return self.sections.get(dotted[len("section:") :])
         if dotted == "body":
             return self.preamble
-        if dotted in self.fields:
-            value = self.fields[dotted]
+        key = dotted[len("frontmatter.") :] if dotted.startswith("frontmatter.") else dotted
+        if key in self.fields:
+            value = self.fields[key]
             if isinstance(value, list):
                 return ", ".join(str(v) for v in value)
             return "" if value is None else str(value)

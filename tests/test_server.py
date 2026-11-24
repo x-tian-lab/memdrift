@@ -117,3 +117,80 @@ def test_url_carries_token(repo):
         assert f"t={srv.token}" in server_mod.url_for(srv)
     finally:
         srv.server_close()
+
+
+# --------------------------------------------------- DNS rebinding / CSRF
+
+
+@pytest.mark.parametrize(
+    "header,expected",
+    [
+        ("127.0.0.1:7787", True),
+        ("localhost:7787", True),
+        ("LocalHost:7787", True),
+        ("[::1]:7787", True),
+        ("127.0.0.1", True),
+        # a rebinding attack keeps the attacker's own name in Host
+        ("evil.test", False),
+        ("evil.test:7787", False),
+        ("attacker.example.com:7787", False),
+        ("192.168.1.10:7787", False),
+        # no Host at all: a script, not a browser
+        (None, True),
+        ("", True),
+    ],
+)
+def test_host_header_allowed(header, expected):
+    assert server_mod.host_header_allowed(header) is expected
+
+
+@pytest.mark.parametrize(
+    "origin,host,expected",
+    [
+        (None, "127.0.0.1:1", True),
+        ("http://127.0.0.1:1", "127.0.0.1:1", True),
+        ("http://evil.test", "127.0.0.1:1", False),
+        ("https://evil.test:7787", "evil.test:7787", True),  # matches, caught by Host check
+        ("null", "127.0.0.1:1", False),
+        ("http://127.0.0.1:1", None, False),
+    ],
+)
+def test_origin_matches_host(origin, host, expected):
+    assert server_mod.origin_matches_host(origin, host) is expected
+
+
+def test_rebinding_request_is_rejected_end_to_end(repo):
+    """A valid token with a foreign Host must still be refused."""
+    import http.client
+
+    srv = server_mod.make_server(repo, port=0)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        port = srv.server_address[1]
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.putrequest("GET", f"/?t={srv.token}", skip_host=True)
+        conn.putheader("Host", "evil.test")
+        conn.endheaders()
+        resp = conn.getresponse()
+        assert resp.status == 403
+        conn.close()
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_cross_origin_request_is_rejected(repo):
+    import http.client
+
+    srv = server_mod.make_server(repo, port=0)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        port = srv.server_address[1]
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request("GET", f"/?t={srv.token}", headers={"Origin": "http://evil.test"})
+        resp = conn.getresponse()
+        assert resp.status == 403
+        conn.close()
+    finally:
+        srv.shutdown()
+        srv.server_close()

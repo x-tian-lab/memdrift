@@ -31,6 +31,36 @@ def test_plain_relative_path_is_untouched():
     assert redact_text("clients/acme.md") == "clients/acme.md"
 
 
+def test_windows_path_embedded_in_text_is_redacted():
+    """A path pasted mid-sentence, with a known vault root, keeps its shape."""
+    root = r"C:\Users\alice\vault"
+    out = redact_text(
+        "Source: " + root + r"\clients\contract.pdf" + " (see attachment)",
+        root=root,
+    )
+    assert out == "Source: ~/clients/contract.pdf (see attachment)"
+    assert "alice" not in out
+
+
+def test_truncated_preview_path_leaks_no_directories():
+    """`differ.preview()` cuts Change values at 72 chars. The ellipsis means
+    the path is incomplete — keeping its tail would expose `AppData` etc."""
+    out = redact_text(
+        "Notes. Source: C:/Users/admin/AppData/Loc…",
+        root=r"C:\Users\admin\AppData\Local\Temp\vault",
+    )
+    assert "AppData" not in out
+    assert "admin" not in out
+    assert "…" in out
+
+
+def test_short_absolute_path_loses_the_username():
+    """Only two segments long: the username must still not survive."""
+    out = redact_text(r"C:\Users\alice\x")
+    assert "alice" not in out
+    assert out == "~/x"
+
+
 def test_redaction_is_idempotent():
     once = redact_text(r"C:\Users\alice\vault\a.md")
     assert redact_text(once) == once

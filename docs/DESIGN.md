@@ -1,4 +1,4 @@
-# 设计说明（W1 实现）
+# 设计说明（W1–W3 实现）
 
 这份文档记录 PRD 落地时做的判断和偏差。PRD 是意图，这里是决定。
 
@@ -132,19 +132,70 @@ repo ──► events.build() ──► EventStream ──┬──► digest.re
 
 不做的理由：加密要引入密钥管理（放哪、怎么轮换、丢了怎么办），而这一层的价值在于「可读的历史」。半吊子的加密比诚实的不加密更危险——它给人虚假的安全感。真需要，就把目录放到加密卷上，那是操作系统已经解决的问题。
 
+## 10. revert 与 MCP（W3）
+
+### 10.1 revert 是追加，不是改写
+
+三种粒度（`--field` / `--page` / `--commit`）都走同一条写路径：先算出 `Plan`（零写入），再落盘，最后记一个新 commit。
+
+为什么不 rewrite：这个工具的整个存在理由就是"看 agent 对你做了什么"。改写历史会让 `log` 撒谎——00:12 那次坏提取消失，`blame` 指向一个从未存在过的 commit。所以 `revert` 之后 `blame` 同时指两个 commit：引入坏值的那个，和收回它的那个。这比"干净的历史"有用。
+
+`plan_field` 有一个容易写错的点：`add` 这种 change 没有 field 名，但它确实是字段诞生的那一刻。如果过滤只认 `field == name`，初始提交永远匹配不上，第一次 revert 就会报"没有 commit 改过这个字段"。所以 `add` 也算"碰过"，且当只有一条时，恢复目标是**不存在**（把字段删掉）。
+
+### 10.2 字节级还原踩的两个坑
+
+| 坑 | 现象 | 修法 |
+|---|---|---|
+| YAML 引号丢失 | `pricing: "$45k"` 还原成 `pricing: $45k`。两者 YAML 等价，但一个字段的 revert 变成了整文件 diff | `_scalar_like()` 借用原始标量的引号风格，值仍来自快照 |
+| 换行被翻译 | 引号修完后 diff 空了，sha256 还是不同：224 → 240 字节，多出 16 个 CRLF | `read_text(newline="")` / `write_text(newline="")` |
+
+第二条是 Windows 特有的：`Path.write_text` 默认把 `\n` 翻成 `\r\n`。只改一个字段却让整个文件的行尾全变，在任何 diff 工具里都是一场灾难。
+
+顺带暴露了一个真 bug：`parse.field_text("frontmatter.pricing")` 一直返回 `None`，因为 `fields` 里存的是裸键 `pricing`，而调用方传的是带前缀的名字。在此之前没人调用这个组合，revert 是第一个用户。
+
+### 10.3 MCP：借 waku-agent 的四件事
+
+看了 [waku-agent](https://github.com/ShenSeanChen/waku-agent)（一个本地 memory 的 MCP 客户端）之后，明确借鉴了四点，也明确否掉了两点。
+
+**借的：**
+
+1. **点号工具名，provider 层再降级。** `memory.history` 在模型眼里是一家人；`memory_history` 是五个不相关的工具。但部分 provider 的 name 字段只收 `^[a-zA-Z0-9_-]{1,64}$`，所以 `provider_name()` 只在那层做替换，线上仍用点号。
+2. **`readOnlyHint` 就是审批策略。** 五个读工具标 `readOnlyHint: true`，两个写工具标 `false`，`memory.revert` 再加 `destructiveHint`。尊重注解的客户端会自动放行读、弹窗确认写，用户零配置；不尊重注解的客户端回落到"每次都问"，也是安全的。**但安全从不依赖这个注解**——`memory.revert` 无论谁读都是写入。
+3. **两层浏览器防御。** waku 用 `same_origin()` + `host_allowed()`。我们原来只有 token，现在 `serve` 同时校验 `Host` 白名单和 `Origin`：DNS rebinding 把 `evil.test` 指到 127.0.0.1 时，token 有效也拿不到数据。
+4. **dashboard 就是一个读已落盘文件的 stdlib server。** 我们没有另起一套数据层，`serve` 和 `digest` 都吃 `events.build()`。
+
+**没借的：**
+
+- **官方 MCP SDK。** 这个包的全部价值在于"能放在记忆目录旁边"。为了在 stdin/stdout 上说 JSON 而引入一个 web 框架级的依赖，比它服务的东西还大。`rpc.py` 两百行，两种帧格式（逐行 JSON / `Content-Length`）都认，因为客户端对"标准传输"没共识——只支持一种的服务器会在一半编辑器里神秘地"连不上"。
+- **把它做成 MCP 客户端。** waku 是客户端（它有 `MCPBridge`），我们是服务端。角色不同，只借 UX，不借架构。
+
+### 10.4 MCP 侧的三个"不能"
+
+- **不能 `init`。** 客户端启动时会拉起 server，如果目录还没初始化就崩，用户看到的是"服务器坏了"。所以 `mcp` 不走 `_open()`，空仓库下所有读工具返回空结果而不是报错，`init` 仍然是人做的决定。
+- **不能让 stdout 出现别的东西。** 协议就在 stdout 上，banner 一律走 stderr。`click.echo(..., err=True)` 不是洁癖，是正确性。
+- **不能默认真写。** `memory.revert` 的 `dry_run` 默认 `true`。agent 要撤销必须调两次，第二次显式 `dry_run: false`。
+
+### 10.5 脱敏层的两个真漏洞（都是测试逼出来的）
+
+写 `test_no_tool_leaks_an_absolute_path` 时连续踩到两个，都不是"可能有问题"，是**真的在泄漏**：
+
+1. **`WIN_PATH_RE` 定义了却从没用过。** Windows 路径嵌在句子中间（`Source: C:\Users\...`）时，只有 `NIX_HOME_RE` 命中 `/Users/admin`，结果变成 `C:~/AppData/...`——用户名没了，机器目录结构还在。现在扫描文本里**任意位置**的绝对路径，不只开头。
+2. **截断过的预览值会漏后半段目录。** `differ.preview()` 把 change 值切到 72 字符存库。若切点落在路径中间（`.../AppData/Loc…`），"保留最后两段"恰好留下 `AppData/Loc…`——仍是机器目录名。现在的规则：**看到 `…` 就整段丢弃**（`~/…`），因为截断的路径对读者本来就没用，猜它就是给自己挖坑。
+
+同时把 `Redactor` 的「不知道 root」和「不要脱敏」拆成两件事：`root=None` 仍剥用户名，`enabled=False`（只由 `--no-redact` 设置）才真的原样保留。原来用 `root=None` 兼职两件事，于是"不知道"等于"不脱敏"，这正是第一个漏洞能活下来的原因。
+
 ## 11. 还没做（下一步）
 
-- `revert`：反向 commit，不 rewrite 历史。
-- MCP server：stdio，`memory_digest / memory_blame / memory_revert / memory_history`。
+- 多写者并发：`refs/head` 是单文件、无锁，目前是「一写多读」。两个 agent 同时 commit 会丢一个。`watch` 把突发写入串行化成一次 commit 是推荐用法，但真并发需要锁。
 - 规则引擎、多目录聚合、跨系统冲突（v1.1）。
 - 路径级 `--exclude` 的 glob 语义目前是简化实现（`**/name/**` 按目录名匹配），够覆盖 `node_modules` 这类场景，不追求完整 gitignore 语法。
 
 ## 12. 截图是跑出来的，不是画的
 
-README 的八张图由 `scripts/render_terminal_shots.py` 生成，流程是：
+README 的十张图由 `scripts/render_terminal_shots.py` 生成，流程是：
 
 1. `make_demo_vault.py` 重建一个干净的演示 vault（5 个 md，内容对应 PRD 的 Acme 案例）；
-2. 用真实的 `memdrift` 可执行文件跑 `init / status / commit / log / blame / show / diff / digest / watch`；
+2. 用真实的 `memdrift` 可执行文件跑 `init / status / commit / log / blame / show / diff / digest / revert / mcp / watch`；
 3. 捕获 stdout（`CLICOLOR_FORCE=1` 保留 click 的 ANSI 颜色），解析成带颜色的 span；
 4. 用 Pillow 画成终端窗口，逐字形做中英文回退（Cascadia Mono 没有中文，落到微软雅黑）。
 
@@ -153,7 +204,9 @@ README 的八张图由 `scripts/render_terminal_shots.py` 生成，流程是：
 - **任何命令失败，脚本直接退出**，不允许画一张"好看但没跑通"的图。
 - watch 那张是**真启动进程**再改三个文件，`committed` 字样来自进程真实输出；没有就当失败。
 - digest 那张要求文件真的落盘，且产物不含 root 路径、不含任何 URL，否则脚本退出。
-- 绝对路径会被替换成 `~/vault`，截图里不出现本机目录。
+- revert 那张要求 `--dry-run` 确实报 dry run、真跑确实输出 `reverted`，两个断言缺一不可。
+- **mcp 那张是真的 stdio 握手**：脚本起一个 `memdrift mcp` 子进程，发 `initialize` / `tools/list` / `tools/call`，图上那七个工具和那几行 commit 都来自 JSON-RPC 响应。工具数不是 7 就退出——改了工具表，图必须跟着变。
+- 绝对路径会被替换成 `~/vault`，截图里不出现本机目录。JSON 里的双反斜杠转义单独处理，否则会漏。
 - 最后一步删掉 `.memgit` 并对比 acme.md 的 sha256，把「历史可删、内容不丢」这张底牌做成可见证据。
 
 改了 CLI 输出格式要重跑这个脚本，否则 README 会和产品对不上。这是唯一的维护成本，比手截图便宜。

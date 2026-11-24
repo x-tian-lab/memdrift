@@ -9,6 +9,7 @@ breaks — that is the point.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -291,6 +292,22 @@ def render(
 
 def redact(text: str, vault: Path) -> str:
     """Screenshots go in a public README: no local absolute paths."""
+    # `mcp --print-config` emits the interpreter as an absolute path. It is
+    # genuinely machine-specific, so show the portable form a reader would
+    # type instead of the workspace we happen to build in.
+    text = re.sub(
+        r"[A-Za-z]:[\\/][^\s\"']*[\\/]python(\.exe)?", "python", text
+    )
+    # The vault path also appears inside JSON strings, where every separator
+    # is doubled (``-C "C:\\\\Users\\\\..."``). Match those first: plain
+    # `str(vault)` cannot, and the escaped form would slip through.
+    escaped = str(vault).replace("\\", "\\\\")
+    for pattern in {
+        escaped,
+        str(vault).replace("\\", "\\\\\\\\"),
+        str(vault).replace("\\", "/"),
+    }:
+        text = text.replace(pattern, "~/vault")
     for variant in {str(vault), str(vault).replace("\\", "/"), "/" + str(vault).replace("\\", "/")}:
         text = text.replace(variant, "~/vault")
     text = text.replace(str(vault.parent), "~")
@@ -368,6 +385,79 @@ def capture_watch(memdrift: Path, vault: Path, repo_root: Path, seconds: float =
     if "committed" not in out:
         raise SystemExit(f"watcher did not commit — output was:\n{out}")
     return out
+
+
+def capture_mcp(memdrift: Path, vault: Path) -> tuple[str, str]:
+    """Talk to the real MCP server over stdio and render *its* answers.
+
+    Not a mocked tool table: the list of tools and the revert plan below are
+    parsed from actual JSON-RPC responses. If a tool disappears or changes its
+    approval hint, the screenshot changes with it.
+    """
+    proc = subprocess.Popen(
+        [str(memdrift), "-C", str(vault), "mcp"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    counter = {"id": 0}
+
+    def ask(method: str, params: dict | None = None) -> dict:
+        counter["id"] += 1
+        message: dict = {"jsonrpc": "2.0", "id": counter["id"], "method": method}
+        if params is not None:
+            message["params"] = params
+        proc.stdin.write(json.dumps(message) + "\n")
+        proc.stdin.flush()
+        line = proc.stdout.readline()
+        if not line:
+            raise SystemExit(
+                "mcp server closed the pipe:\n" + (proc.stderr.read() or "")
+            )
+        return json.loads(line)
+
+    try:
+        ask(
+            "initialize",
+            {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "shots", "version": "1"},
+            },
+        )
+        tools = ask("tools/list")["result"]["tools"]
+        history = ask(
+            "tools/call",
+            {"name": "memory.history", "arguments": {"limit": 3}},
+        )["result"]["structuredContent"]
+    finally:
+        proc.stdin.close()
+        proc.wait(timeout=15)
+
+    if len(tools) != 7:
+        raise SystemExit(f"expected 7 MCP tools, got {len(tools)}")
+
+    listing = [
+        "tools/list → 7 tools · readOnlyHint decides whether a client asks first",
+        "",
+    ]
+    for tool in tools:
+        ann = tool["annotations"]
+        tag = "read" if ann["readOnlyHint"] else "WRITE"
+        if ann.get("destructiveHint"):
+            tag += " · destructive"
+        listing.append(f"  {tool['name']:<18} {tag}")
+
+    plan = [
+        "  › tools/call memory.history {limit: 3}",
+        "",
+    ]
+    for item in history["commits"]:
+        plan.append(f"  {item['id']}  {item['message']}")
+    return "\n".join(listing), "\n".join(plan)
 
 
 def main() -> None:
@@ -474,6 +564,82 @@ def main() -> None:
         [("memdrift -C ~/vault digest --since 7d", redact(digest_out, vault))],
         assets / "08-digest.png",
         title="memdrift — one file, safe to send",
+    )
+
+    # revert: a bad extraction, then undo it. History stays append-only.
+    # Commit the pending human fix first so the screenshots stay readable.
+    run([str(memdrift), "-C", str(vault), "commit", "-m", "human fix: date"])
+    acme = vault / "clients" / "acme.md"
+    acme.write_text(
+        acme.read_text(encoding="utf-8", newline="").replace(
+            'pricing: "$48k"', 'pricing: "$12k"'
+        ),
+        encoding="utf-8",
+        newline="",
+    )
+    run(
+        [
+            str(memdrift), "-C", str(vault), "commit",
+            "-m", "extract: pricing dropped",
+        ]
+    )
+    revert_dry = run(
+        [
+            str(memdrift), "-C", str(vault), "revert",
+            "--field", "frontmatter.pricing",
+            "--page", "clients/acme.md",
+            "--dry-run",
+        ]
+    )
+    revert_real = run(
+        [
+            str(memdrift), "-C", str(vault), "revert",
+            "--field", "frontmatter.pricing",
+            "--page", "clients/acme.md",
+        ]
+    )
+    log_after = run([str(memdrift), "-C", str(vault), "log", "--limit", "3"])
+    if "nothing written" not in revert_dry and "dry run" not in revert_dry:
+        raise SystemExit("revert --dry-run did not report a dry run")
+    if "reverted" not in revert_real:
+        raise SystemExit("revert did not apply")
+    render(
+        [
+            (
+                "memdrift -C ~/vault revert --field frontmatter.pricing \\\n"
+                "  --page clients/acme.md --dry-run",
+                redact(revert_dry, vault),
+            ),
+            (
+                "memdrift -C ~/vault revert --field frontmatter.pricing \\\n"
+                "  --page clients/acme.md",
+                redact(revert_real, vault),
+            ),
+            ("memdrift -C ~/vault log --limit 3", redact(log_after, vault)),
+        ],
+        assets / "09-revert.png",
+        title="memdrift — undo without rewriting history",
+    )
+
+    # MCP: talk to the real stdio server, render its real answers.
+    mcp_config = run([str(memdrift), "-C", str(vault), "mcp", "--print-config"])
+    mcp_tools, mcp_history = capture_mcp(memdrift, vault)
+    # The config block is nine lines of JSON that say one thing. Collapse it
+    # to the two lines a reader needs; the full form is in the README.
+    short_config = (
+        '{\n  "command": "python",\n'
+        '  "args": ["-m", "memdrift", "-C", "~/vault", "mcp"]\n}'
+    )
+    if '"memdrift"' not in mcp_config:
+        raise SystemExit("mcp --print-config did not emit a server block")
+    render(
+        [
+            ("memdrift -C ~/vault mcp --print-config", short_config),
+            ("stdio · initialize / tools/list", redact(mcp_tools, vault)),
+            ("stdio · tools/call", redact(mcp_history, vault)),
+        ],
+        assets / "10-mcp.png",
+        title="memdrift — the same memory, from any MCP client",
     )
 
     # watch: run it for real, poke three files inside one debounce window

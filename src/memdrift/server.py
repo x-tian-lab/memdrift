@@ -65,6 +65,48 @@ def check_host(host: str) -> str:
     return LOOPBACK if host in {"localhost", "127.0.0.1"} else "::1"
 
 
+LOOPBACK_NAMES = {"127.0.0.1", "localhost", "::1"}
+
+
+def host_header_allowed(header: str | None) -> bool:
+    """Does this request's ``Host`` name *this machine*?
+
+    The token in the URL is the primary defence, so this looks redundant —
+    until DNS rebinding. An attacker's page at ``evil.test`` keeps its own
+    name in ``Host`` after that name is re-pointed at 127.0.0.1, so the
+    browser sends our server ``Host: evil.test`` and the page can read the
+    response. The token would still stop it (the attacker cannot guess it),
+    but a second lock costs one line and removes the class entirely.
+
+    A request with no ``Host`` is a script, not a browser; those are allowed
+    because the token already gates them.
+    """
+    if not header or not header.strip():
+        return True
+    value = header.strip().lower()
+    if value.startswith("["):  # [::1]:7787
+        name = value[1:].split("]", 1)[0]
+    elif value.count(":") == 1:  # 127.0.0.1:7787
+        name = value.rsplit(":", 1)[0]
+    else:
+        name = value
+    return name in LOOPBACK_NAMES
+
+
+def origin_matches_host(origin: str | None, host: str | None) -> bool:
+    """A browser adds ``Origin`` to every cross-site request; require it to
+    name the same host we were addressed by. No ``Origin`` means no browser."""
+    if not origin:
+        return True
+    from urllib.parse import urlsplit
+
+    try:
+        netloc = urlsplit(origin.strip()).netloc.lower()
+    except ValueError:
+        return False
+    return bool(netloc) and netloc == (host or "").strip().lower()
+
+
 PAGE_CSS = CSS + """
 nav { display: flex; gap: 18px; margin: 22px 0 6px; font-size: 13.5px; }
 nav a { color: var(--accent); text-decoration: none; }
@@ -142,6 +184,15 @@ class _Handler(BaseHTTPRequestHandler):
         supplied = (query.get("t") or [""])[0]
         return secrets.compare_digest(supplied, self.token)
 
+    def _request_allowed(self) -> tuple[bool, str]:
+        """Three locks in order: Host names us, Origin (if any) agrees, token matches."""
+        host = self.headers.get("Host")
+        if not host_header_allowed(host):
+            return False, "wrong Host header"
+        if not origin_matches_host(self.headers.get("Origin"), host):
+            return False, "cross-origin request"
+        return True, ""
+
     def _redactor(self, query: dict) -> Redactor:
         keep_quotes = (query.get("quotes") or ["1"])[0] != "0"
         return Redactor(root=str(self.repo.root), keep_quotes=keep_quotes)
@@ -151,6 +202,10 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 (http.server API)
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
+        ok, why = self._request_allowed()
+        if not ok:
+            self._deny(HTTPStatus.FORBIDDEN, why)
+            return
         if not self._authorised(query):
             self._deny(HTTPStatus.FORBIDDEN, "missing or wrong token")
             return

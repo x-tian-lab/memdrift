@@ -447,7 +447,7 @@ def digest(
         )
     redactor = Redactor(root=str(repo.root), keep_quotes=not no_quote)
     if no_redact:
-        redactor.root = None
+        redactor.enabled = False
     try:
         stream = events_mod.build(repo, since=since, until=until, page=page, redactor=redactor)
     except ValueError as exc:
@@ -584,6 +584,125 @@ def status(obj: dict, as_json: bool) -> None:
         click.echo(f"  {click.style('~', fg='yellow')} {path}")
     for path in report.deleted:
         click.echo(f"  {click.style('-', fg='red')} {path}")
+
+
+@main.command()
+@click.option("--field", "field_name", default=None, help="Field to restore, e.g. frontmatter.pricing.")
+@click.option("--page", default=None, help="Page to restore (needs --field, or --commit).")
+@click.option("--commit", "commit_ref", default=None, help="Restore to this commit / undo this commit.")
+@click.option("--dry-run", is_flag=True, help="Show the plan; write nothing.")
+@click.option("--author", default=None, help="Name to record on the revert commit.")
+@click.option("--json", "as_json", is_flag=True)
+@click.pass_obj
+def revert(
+    obj: dict,
+    field_name: str | None,
+    page: str | None,
+    commit_ref: str | None,
+    dry_run: bool,
+    author: str | None,
+    as_json: bool,
+) -> None:
+    """Undo a change by committing its inverse. History is never rewritten.
+
+    \b
+    memdrift revert --field frontmatter.pricing --page clients/acme.md
+    memdrift revert --page clients/acme.md --commit 9f2c1ab
+    memdrift revert --commit 9f2c1ab
+    """
+    from . import revert as revert_mod
+
+    repo = _open(obj["directory"])
+    try:
+        plans = revert_mod.plan(repo, field_name=field_name, page=page, commit_ref=commit_ref)
+        result = revert_mod.execute(repo, plans, dry_run=dry_run, author_name=author)
+    except RepoError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    if as_json:
+        _dump(
+            {
+                "dry_run": dry_run,
+                "plans": [
+                    {
+                        "path": p.path,
+                        "field": p.field,
+                        "before": p.before,
+                        "after": p.after,
+                        "note": p.note,
+                        "skipped": p.skipped,
+                        "reason": p.reason,
+                    }
+                    for p in plans
+                ],
+                "commit": result.commit["id"] if result.commit else None,
+                "written": result.written,
+            }
+        )
+        return
+
+    for item in plans:
+        if item.skipped:
+            click.echo("  " + click.style(revert_mod.describe(item), fg="yellow"))
+        else:
+            click.echo("  " + revert_mod.describe(item))
+
+    if all(p.skipped for p in plans):
+        return
+    if dry_run:
+        click.echo(click.style("dry run — nothing written", fg="black", dim=True))
+        return
+    if not result.written:
+        click.echo(click.style("nothing changed on disk", fg="yellow"))
+        return
+    click.echo(
+        click.style(f"reverted {len(result.written)} item(s)", fg="green")
+        + (" as " + short(result.commit["id"]) if result.commit else "")
+    )
+
+
+@main.command()
+@click.option("--no-quote", is_flag=True, help="Never return verbatim evidence quotes.")
+@click.option("--print-config", is_flag=True, help="Print the JSON block to paste into a client.")
+@click.pass_obj
+def mcp(obj: dict, no_quote: bool, print_config: bool) -> None:
+    """Serve this memory dir over MCP (stdio), for Cursor / Claude / Zed."""
+    import json as _json
+
+    from .mcp import build_server
+
+    # Not `_open`: it refuses a directory without `.memgit/`, and a client that
+    # launches this at startup must not die on a vault the human has not
+    # initialised yet. `init` stays a deliberate human act; the server just
+    # answers every read with "nothing yet" until it happens.
+    repo = Repo(Path(obj["directory"]).expanduser().resolve())
+
+    if print_config:
+        # The command a client needs depends on how memdrift was installed.
+        # `sys.executable -m memdrift` works for a pipx/venv install *and* a
+        # source checkout, which a bare `memdrift` on PATH does not always.
+        import sys
+
+        entry = {
+            "mcpServers": {
+                "memdrift": {
+                    "command": sys.executable,
+                    "args": ["-m", "memdrift", "-C", str(repo.root), "mcp"],
+                }
+            }
+        }
+        click.echo(_json.dumps(entry, indent=2, ensure_ascii=False))
+        return
+
+    server = build_server(repo, keep_quotes=not no_quote)
+    click.echo(
+        click.style("memdrift mcp", fg="green")
+        + click.style(f" · {repo.root} · stdio · Ctrl+C to stop", fg="black", dim=True),
+        err=True,
+    )
+    # stdout is the wire: anything human-readable goes to stderr or corrupts
+    # the stream. click.echo above is already routed to stderr for that reason.
+    raise SystemExit(server.serve())
 
 
 @main.command(name="index")

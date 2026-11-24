@@ -82,6 +82,56 @@ memdrift -C ~/vault serve --open
 
 Both read the same redacted event stream, so they cannot disagree, and neither can forget to redact.
 
+### And from inside your editor
+
+Your agent already reads that memory directory. `memdrift mcp` puts the *history* next to it, so the agent can answer "did you change my prices?" with a commit id instead of a guess:
+
+![memdrift mcp --print-config, then a real stdio session listing 7 tools and calling memory.history](docs/assets/10-mcp.png)
+
+Seven tools, named so a model can tell them apart:
+
+| Tool | | What it answers |
+|---|---|---|
+| `memory.history` | read | what happened recently, optionally for one page |
+| `memory.blame` | read | which commit last touched each field, and the evidence behind it |
+| `memory.diff` | read | field-level diff between two commits |
+| `memory.page` | read | a page as it stood at a given commit |
+| `memory.digest` | read | a window of changes as structured events, with risk flags |
+| `memory.commit` | **write** | snapshot the working tree, with a required message |
+| `memory.revert` | **write** | undo by committing the inverse |
+
+The read tools carry `readOnlyHint: true`, so a client that honours annotations runs them silently and stops to ask before the two writers — no client-side code on your part. The names are dotted (`memory.history`) because that is what reads as one family to a model; some providers reject dots in name fields, so those get the flattened `memory_history` form on the wire only.
+
+Wire it up:
+
+```bash
+memdrift -C ~/vault mcp --print-config   # paste the JSON into your client
+memdrift -C ~/vault mcp                  # or run the server yourself
+```
+
+stdout is the protocol, so the server prints nothing else there — the banner goes to stderr. Both newline-delimited JSON and `Content-Length` framing are accepted, because clients disagree about which is "the" transport.
+
+## Undo, without rewriting history
+
+The failure this project exists for: an agent ingests a bad email, and `pricing: "$45k"` becomes `"$12k"`. Three granularities, all of them **append-only** — a revert is a new commit that undoes an old one, never an edit of the past:
+
+```bash
+memdrift -C ~/vault revert --field frontmatter.pricing --page clients/acme.md
+memdrift -C ~/vault revert --page clients/acme.md --commit 9f2c1ab
+memdrift -C ~/vault revert --commit 9f2c1ab          # undo everything that commit did
+```
+
+![revert --dry-run shows the plan, the real run applies it, log shows the bad commit still present](docs/assets/09-revert.png)
+
+Look at the last three lines of that image: `revert:` is commit three, `extract: pricing dropped` is still commit two, unchanged. `blame` still points at the commit that introduced the bad value — it now *also* points at the commit that took it back out. Rewriting would make the log lie, which is the one thing a tool for "what did my agent do to me" cannot afford.
+
+Two details that took a bug each to get right:
+
+- **YAML quoting survives.** Restoring `"$48k"` writes `"$48k"`, not `$48k`. Both parse the same, but only one keeps a one-field revert from showing up as a whole-file diff.
+- **Line endings survive.** On Windows, `Path.write_text` turns every `\n` into `\r\n`. Reading and writing with `newline=""` makes a page revert return a file that is **byte-identical** to the snapshot — verified by sha256, not by eye.
+
+`--dry-run` prints the plan and writes nothing. The MCP tool defaults to `dry_run: true` for the same reason.
+
 ## Quickstart
 
 ```bash
@@ -123,9 +173,11 @@ It is the only reason to point a tool at a directory you care about, so it is th
 | `memdrift -C <dir> status` | Uncommitted changes |
 | `memdrift -C <dir> digest [--since 1d] [--no-quote] [-o file]` | Self-contained HTML report, redacted by default |
 | `memdrift -C <dir> serve [--port 7787] [--open]` | Read-only local UI on 127.0.0.1, token in the URL |
+| `memdrift -C <dir> revert [--field f] [--page p] [--commit c] [--dry-run]` | Undo as a new commit; history is never rewritten |
+| `memdrift -C <dir> mcp [--print-config] [--no-quote]` | Serve this directory over MCP (stdio) |
 | `memdrift -C <dir> index --rebuild` | Rebuild the SQLite index from commit files |
 
-Add `--json` to `log`, `diff`, `show`, `blame`, `status`, `commit` for machine output.
+Add `--json` to `log`, `diff`, `show`, `blame`, `status`, `commit`, `revert` for machine output.
 
 ## Sharing it without leaking it
 
@@ -133,12 +185,15 @@ A memory directory is a biography. The moment you paste a digest into a group ch
 
 | Risk | Default behaviour |
 |---|---|
-| **Machine paths** | `C:\Users\alice\vault\a.md` → `a.md`. The root is stripped everywhere: change lists, evidence refs, page titles. |
+| **Machine paths** | `C:\Users\alice\vault\a.md` → `~/clients/a.md`. The root is stripped everywhere: change lists, evidence refs, MCP tool output. A path that is *not* under the root keeps only its last two segments, so `AppData/Local/...` never survives. |
+| **Pasted paths inside values** | A path in the middle of a sentence is redacted too, not just one at position 0. Values are stored as 72-char previews, so a path cut mid-directory is replaced wholesale rather than half-guessed. |
 | **Verbatim quotes** | Truncated to 120 chars with a `…`. `--no-quote` keeps the reference (`email:msg-1882`) and drops the text. |
-| **Private pages** | `private: true` in frontmatter removes the page *and every evidence entry pointing at it* — otherwise the leak just moves one hop. |
+| **Private pages** | `private: true` in frontmatter removes the page *and every evidence entry pointing at it* — otherwise the leak just moves one hop. `memory.page` refuses such a page outright. |
 | **Escaping** | All memory text is HTML-escaped; a page whose title is `<script>` renders as text. |
 | **`serve` binding** | Loopback only. `--host 0.0.0.0` is refused by design, not by config. |
-| **CSRF** | A per-process random token in the URL; requests without it get 403, so another site cannot read your history via `localhost`. |
+| **CSRF / DNS rebinding** | A per-process random token in the URL, plus a `Host` whitelist and an `Origin` match. A page that rebinds `evil.test` to 127.0.0.1 gets 403 even with a valid token. |
+| **MCP writes** | The two writer tools are annotated `readOnlyHint: false`; `memory.revert` also declares `destructiveHint` and defaults to `dry_run: true`. |
+| **MCP path traversal** | A `page` argument is resolved and rejected if it leaves the memory root — an agent cannot ask for `../../etc/passwd`. |
 
 `--no-redact` exists and prints a warning. Use it only for a file that never leaves the machine.
 
@@ -189,6 +244,8 @@ When heading structure collapses (a page gets rewritten wholesale), attribution 
     index.sqlite          # rebuildable cache
 ```
 
+Code: `repo` (objects, refs) · `differ` (field-level diff) · `events` (the one stream) · `security` (redaction) · `digest` / `server` (the two views) · `revert` (undo) · `rpc` / `mcp` (the agent channel).
+
 ## Development
 
 ```bash
@@ -203,11 +260,13 @@ Every screenshot in this README is produced by that last command: it builds a de
 
 ## Status
 
-v0.1, week 2 of the plan: `init · watch · commit · log · diff · show · blame · status · digest · serve` work on a real directory. `revert` and the MCP server are next. Nothing here is stable enough to embed yet.
+v0.1, week 3 of the plan: `init · watch · commit · log · diff · show · blame · status · digest · serve · revert · mcp` all work on a real directory, and 174 tests pass. Nothing here is stable enough to embed yet.
 
-Requirements: Python 3.11+, macOS / Linux / Windows. Three dependencies: `click`, `python-frontmatter`, `watchdog` (and `jinja2`, once the digest lands).
+Known gap: `.memgit/refs/head` is a single file with no lock, so it is **one writer, many readers**. Two agents committing at the same instant can lose a commit. `watch` is the intended path — it serialises a burst into one commit — but true concurrent writers need a lock, and faking one would be worse than saying so.
 
-Local only. No network calls, ever.
+Requirements: Python 3.11+, macOS / Linux / Windows. Three dependencies: `click`, `python-frontmatter`, `watchdog`. The MCP server is stdlib-only — it does not need the official SDK, and a JSON-RPC layer we can read in one sitting beats a dependency that breaks in someone else's editor.
+
+Local only. No network calls, ever: `serve` binds to loopback, `mcp` speaks over stdin/stdout.
 
 ## License
 
