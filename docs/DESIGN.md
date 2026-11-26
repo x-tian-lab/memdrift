@@ -184,11 +184,17 @@ repo ──► events.build() ──► EventStream ──┬──► digest.re
 
 同时把 `Redactor` 的「不知道 root」和「不要脱敏」拆成两件事：`root=None` 仍剥用户名，`enabled=False`（只由 `--no-redact` 设置）才真的原样保留。原来用 `root=None` 兼职两件事，于是"不知道"等于"不脱敏"，这正是第一个漏洞能活下来的原因。
 
-## 11. 还没做（下一步）
+## 11. 还没做的三件事
 
-- 多写者并发：`refs/head` 是单文件、无锁，目前是「一写多读」。两个 agent 同时 commit 会丢一个。`watch` 把突发写入串行化成一次 commit 是推荐用法，但真并发需要锁。
-- 规则引擎、多目录聚合、跨系统冲突（v1.1）。
-- 路径级 `--exclude` 的 glob 语义目前是简化实现（`**/name/**` 按目录名匹配），够覆盖 `node_modules` 这类场景，不追求完整 gitignore 语法。
+与 README 的 "Not done yet" 一一对应。写在这里是为了让「可以安全假设什么」有据可查，而不是悄悄略过。
+
+**1. 多写者并发。** `refs/head` 是单文件、无锁，目前是「一写多读」。两个 agent 同时 commit 会丢一个：第二个读到旧 HEAD、写好自己的 commit，再把第一个刚推进的 ref 覆盖掉。现在没有乐观重试，也没有合并，代码里也没有假装有。推荐用法是 `watch`——把突发写入串行化成一次 commit。真并发需要一把锁。
+
+**2. 规则引擎、多目录聚合、跨系统冲突检测（v1.1）。** memdrift 只回答「变了什么」和「它自称为什么这么改」，不判断这个改动该不该发生；不能把两个 memory 目录的历史合起来看；也不会发现 Hindsight 和 mem0 对同一个事实说法相反。这些是下一层的问题，v0.1 不做。
+
+**3. `--exclude` 的完整 glob 语义。** 目前 `**/name/**` 按目录名匹配，够把 `node_modules`、`.venv` 挡在快照外，但不是 gitignore 语法：嵌套取反、字符类、锚定模式的行为都和 git 用户的预期不同。
+
+加密不在这三件事里：它是**决定**，不是缺口（见 §9.6）。
 
 ## 12. 截图是跑出来的，不是画的
 
@@ -210,3 +216,86 @@ README 的十张图由 `scripts/render_terminal_shots.py` 生成，流程是：
 - 最后一步删掉 `.memgit` 并对比 acme.md 的 sha256，把「历史可删、内容不丢」这张底牌做成可见证据。
 
 改了 CLI 输出格式要重跑这个脚本，否则 README 会和产品对不上。这是唯一的维护成本，比手截图便宜。
+
+`docs/onboarding.html` 是同一约束的另一种形态：一个 9 步可点击的引导，从「我什么都不知道」走到「完全理解」。它由 `scripts/build_onboarding.py` 生成，同样真跑命令（含真起 `serve`、真做 MCP stdio 握手），由 `scripts/verify_onboarding.py` 校验自包含、无本机路径、九步齐全。做它的理由很直接：README 是给「已经想用的人」看的，而一个第一次听说这个东西的人需要的是**能乱点的路径**，不是从上往下读的说明书。收尾页把 §11 那三件没做的事也摆出来——知道边界才算真的会用。
+
+## 13. 上线前质检：接口泄露是怎么漏的
+
+这次检查的结论只有一句：**"私有页不出现"这条规则，过去只写在"列表"里，没有写在"点名"里。**
+
+`events.build()` 会把 `private: true` 的页面连同指向它的 evidence 一起丢掉，所以 digest、`serve` 的列表、`ui` 的时间线都干净。但只要有第二个入口能**按名字**要一个页面，那个入口就得自己再问一遍：
+
+| 入口 | 修复前 | 修复后 |
+|---|---|---|
+| `memory.page` | 拒绝 | 拒绝 |
+| `memory.blame` | **返回私有页每个字段的值** | 拒绝 |
+| `memory.history` | 列出只碰过私有页的 commit，连 message | 过滤 + `hidden_commits` 计数 |
+| `memory.diff` | **返回私有页路径与新旧值** | 丢弃 + `hidden` 计数 |
+| `memory.revert` | 对私有页出计划，计划里带新旧值 | 拒绝 |
+| `serve` 的 `/page/<path>` | 列表里没有，但**URL 直接能打开** | 403 |
+| `ui` 的 `/api/revert` | 页面视图拒绝，撤销接口不拒绝 | 拒绝 |
+
+所以规则挪到了 `events.is_private_page(repo, path)`：它同时看**最后一个 commit 的快照**和**磁盘上现在的文件**。后者不能省——agent 刚写出来、还没 commit 的页面不在任何快照里，但已经带着 `private: true`。
+
+同一类问题还有第二半：**commit message 从来没脱敏过**。message 是自由文本，agent 会把路径粘进去，而 digest 恰恰是"发给客户的那个文件"。现在 message 和 author name 都走同一个 `Redactor`，并且当一条 commit 同时碰了公开页和私有页时，message 里出现的私有路径会被替换成 `(private)`（`events.mask_private`）。丢掉私有页的*变更*不够，名字也得遮住，否则泄露只是换个字段继续发生。
+
+顺带修掉的三处小口子，都属于"输入来自 agent，代码把它当自己人"：
+
+- `rpc.py` 的 `Content-Length` 原来没有上限，`9GB` 就是一次内存分配；现在 8MiB 封顶，超了回 `-32700` 而不是挂断。行分隔帧同样有上限。
+- `rpc.py` 的 `INTERNAL_ERROR` 原来回 `Type: message`，而 `OSError` 的 message 里常常就是绝对路径；现在只回异常类名。
+- `repo.read_commit(ref)` 直接拿 ref 拼文件路径，`../../x` 会解析到 `commits/` 外面；现在先过 `^[0-9a-f]{3,64}$`，不合格就是"不是 commit id"。
+
+还有一处不是漏洞但会让人不再信任红框：`ui` 的 `/api/commit` 收 `expect` 时先 `sorted()` 再比较，而 `[{"path": "x"}]` 会产出 `(str, None)`，和 `(str, "add")` 排序时抛 `TypeError` → 500。现在是 400，并说清楚缺什么。
+
+**没在这次修掉的**：`memdrift-gui` 独立成第二个 wheel。代码已经按"`serve` 只读 / `ui` 单独一个 server、单独一组锁"分层，但发行层面 GUI 仍在同一个包里，只是 `memdrift ui` 不跑就不启用。原来的文案说"`pip install memdrift` 不含它"，那句话在当时是假的，已经改成如实描述。真正的拆分要动 import 路径、两个 pyproject 和发布流程，不该混在质检里做。
+
+### 13.1 单测看不见的两类问题
+
+两类问题只有把真东西跑起来才暴露，这次都补了会失败的测试，而不是补一句"已验证"。
+
+**布局。** `.app` 那个两栏 grid 曾经挂在 `<main>` 上（`<main id="main" class="app">`），于是 grid 只在 main 内部生效：时间线被压到左边，右半屏一片空白。所有单测都通过——它们检查的是 HTML 里有没有某个字符串，不检查几何。是拿 Chromium 真的量 `getBoundingClientRect()` 才发现的。修法是把网格还给外层容器，`<body>` 也跟着去掉 `class="app"`——两层同名的 grid 会让 `.app` 落进 `body` 的第一列，右栏等于凭空多出 380px 空白。现在 `tests/test_gui.py` 里的 `test_page_has_one_layout_grid_and_it_is_the_outer_div` 钉住三件事：`class="app"` 只出现一次、它是最外层 div、`<body>` 不带这个类。
+
+同一批的还有一个纯字段名错误：摘要读 `st.risk`，而 `/api/state` 返回的是 `st.risky`，于是"3 处建议复核"那行永远不出现。它不报错、不警告，只是安静地少一行字。现在 `test_page_summary_reads_the_field_the_api_returns` 断言脚本里没有 `st.risk`。
+
+**断开连接。** 测试跑完偶尔多出一段 `Exception occurred during processing of request from ('127.0.0.1', 56138)` 并带完整 traceback。来源很普通：客户端（浏览器标签页、测试里的 `urlopen`）在响应写完前就走了，`socketserver` 把它当异常打出来。问题不在于它是 bug，而在于**它会训练人忽略终端**，而 traceback 里又恰好印着本机绝对路径。`Server.handle_error` 现在吞掉 `BrokenPipeError` / `ConnectionResetError`，其他异常只印一行类名，`--verbose` 才印 traceback。`test_a_client_that_leaves_mid_response_is_not_a_traceback` 固定这三种行为。
+
+## 14. 空间边界：为什么默认只读
+
+到了"可以让别人批准"这一步，一个前提就浮出来了：**人的记忆不是一个目录。** 个人有一个 vault，团队有一个共享的，客户发来的还有第三个。一个能写任何目录、又分不清哪个是哪个的工具，迟早会写错那一个。
+
+所以规则写死在代码里，不做成配置项：
+
+| 情形 | 允许什么 |
+|---|---|
+| 刚装上，还没有清单 | **只读**你运行命令时所在的那个目录，别的都不行；写，完全不行 |
+| `memdrift init ~/vault` | 该目录成为 **write** 空间——建库这个动作本身就是声明 |
+| `memdrift space allow ~/shared --read` | 别人的库：能看，仍然写不进去 |
+| `memdrift space allow ~/shared --write` | 你被允许改它 |
+| 其他任何目录 | 拒绝，并把"允许它"的那条命令原样打出来 |
+
+四条刻意的"没有"：
+
+1. **没有 `--allow-all`，也没有能关掉检查的环境变量。** 一个能被一条 flag 关掉的安全边界，等于没有边界，只是多了一次自我说服。
+2. **清单不在 vault 里。** 它在 `~/.memdrift/spaces.json`。你要是把清单放进 vault，那么"clone 一个别人的库"就等于"接受别人写好的授权"——对方可以把 `/` 写进自己的 `spaces.json`，而你只是在 `git clone`。现在 vault 里就算有 `spaces.json`，它也只是一份记忆文件，会被当正文读，不会被当权限读。
+3. **`init` 是唯一的"顺手授权"，因为它不可能顺手。** 建库是显式动作，且当场把 `space: … (write)` 打出来——没被告知过的权限，人是没法推理的。
+4. **清单存在但为空，就是全禁。** 这里踩过一次：最初 `spaces_for()` 在"清单为空"时回落到"当前目录可读"，于是 `space deny` 掉最后一个空间后，当前目录又悄悄可以读了。现在只有**清单文件不存在**时才走隐式规则；文件一旦存在，文件就是唯一事实。解析不了的条目直接丢弃——这是失败关闭的方向，因为把一条拼错的记录当成授权，比拒绝它危险得多。
+
+拦在哪一层：**入口层**，不是库层。`_open()`（CLI 所有命令）、`serve` 启动、`ui` 启动、`mcp` 启动，以及 MCP 的 `memory.commit` / `memory.revert` 两个写工具。`ui` 的写操作每次点击都重读清单，所以在另一个终端 `space deny` 掉之后，下一次点击就失败，不用重启服务。库层（`import memdrift.repo`）不拦：能 `import` 的人本来就能直接写文件，拦他没有意义，而"连导入都要权限"的库是没法测试也没法嵌入的。边界保护的是**工具**，不是整台机器。
+
+`MEMDRIFT_HOME` 只搬清单的位置（测试和把配置放在 `$HOME` 外面的人需要它），它不能清空规则；测试里每个用例一份清单，所以"某目录可写"是每个测试自己声明的，而不是从开发机环境里继承来的。
+
+## 15. 撤销是一个新事件，不是一次擦除
+
+这一条其实从第一天就成立（`revert` 一直是"新增一个 commit"），但只有这一次它变得**可追溯**：以前你能看到"这个值回来了"，看不到"它是被哪一次改动气回来的"。
+
+三处改动：
+
+- 新 commit 的 payload 里多一个 `reverts: sha256:…`，只在真的在撤销某个提交时出现。旧提交的 payload 形状不变，所以历史 id 一个都没动。
+- message 末尾带上 `(undoes 9f2c1ab)`。机器读字段，人读这一行，两者说的是同一件事。
+- 索引加一列（`SCHEMA_VERSION` 2→3，缓存自动重建），于是 `log --json`、MCP 的 `memory.history`、GUI 的时间线都能显示这个指针。页面上是提交标题旁边一个 `↺ d699e0d` 的小胶囊——只显示一次，不给每个字段行都挂一遍。
+
+`execute()` 不要求调用方传 `reverts`：如果所有 actionable plan 都指向同一个 origin commit（单字段撤销、整次提交撤销都属于这种），就自动用那个 id；如果 plans 来自不同的提交（整页恢复到某个快照），就不写——宁可不写，也不要写一个会撒谎的指针。
+
+GUI 的"撤销这次提交"只接受 **HEAD**。理由不是技术限制，是语义：撤销最新一次提交只有一个意思，人和页面都装得下；而"从这里撤销 12 个提交之前的那一次"需要三方推理，那是 CLI 该干的活，命令行能把计划完整打出来。所以非 HEAD 直接 409，并把 `memdrift revert --commit <id> --dry-run` 打在错误信息里。
+
+确认机制扩展到整次提交：`/api/undo` 的 dry-run 返回一份 `_plan_fingerprint`（覆盖每一条 path/field/before/after/skipped，保序），确认时回传，服务端重算比对。单字段撤销和整次提交撤销用两套指纹，因为"你确认的那一行"和"你确认的那一张表"不是同一种东西。

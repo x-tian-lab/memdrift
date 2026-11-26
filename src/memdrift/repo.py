@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import zlib
 from datetime import datetime
 from fnmatch import fnmatch
@@ -28,6 +29,12 @@ from .config import CONFIG_FILENAME, DEFAULT_CONFIG, Config
 
 META_DIR = ".memgit"
 VERSION = "0.1.0"
+
+#: A commit id is hex, optionally prefixed. Anything else is not a commit, and
+#: must not reach the filesystem: ``read_commit`` builds a path out of it, and
+#: ``"../../x"`` would resolve outside ``commits/``. Every other input in this
+#: project is treated as untrusted; a ref from an MCP client is no different.
+COMMIT_ID_RE = re.compile(r"^(?:sha256:)?[0-9a-fA-F]{3,64}$")
 
 
 class RepoError(RuntimeError):
@@ -107,6 +114,21 @@ class Repo:
             repo.config.author_type = author_type
             repo.config.author_name = author_name
             cfg_path.write_text(repo.config.to_toml(), encoding="utf-8")
+
+        # Creating a store is declaring a space: you typed `init` here, so this
+        # install may write here. A vault you merely *receive* never goes
+        # through this path, which is exactly why it stays read-only until
+        # someone runs `memdrift space allow … --write`. Imported here to keep
+        # the module graph acyclic: scope imports nothing from repo.
+        from . import scope
+
+        try:
+            scope.allow(root, mode="write", by=author_name or "you")
+        except (OSError, ValueError):
+            # A read-only home directory (locked down CI, a container with no
+            # writable HOME) must not make `init` fail: the vault is usable,
+            # it just is not registered, and the guard will say so.
+            pass
         return repo
 
     @classmethod
@@ -180,6 +202,7 @@ class Repo:
         author: dict,
         evidence: list[dict],
         confidence: float | None,
+        reverts: str | None = None,
     ) -> dict:
         payload: dict[str, Any] = {
             "parent": parent,
@@ -192,6 +215,14 @@ class Repo:
             "confidence": confidence,
             "memdrift_version": VERSION,
         }
+        if reverts:
+            # Forward pointer, never a backward edit: undoing commit A writes a
+            # new commit B that *says* it undoes A. A keeps its id, its tree,
+            # its message and its place in the chain, so "what did the agent
+            # actually do that night" stays answerable forever. Only present
+            # when it applies, so payloads from before this field existed keep
+            # hashing to the same id.
+            payload["reverts"] = reverts
         cid = "sha256:" + hashlib.sha256(canonical(payload)).hexdigest()
         payload["id"] = cid
 
@@ -204,6 +235,8 @@ class Repo:
         return payload
 
     def read_commit(self, cid: str) -> dict:
+        if not isinstance(cid, str) or not COMMIT_ID_RE.match(cid):
+            raise RepoError(f"not a commit id: {cid!r}")
         path = self.commit_path(cid)
         if not path.exists():
             matches = self._resolve_prefix(cid)

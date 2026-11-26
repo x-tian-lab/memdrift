@@ -46,11 +46,11 @@ def test_truncated_preview_path_leaks_no_directories():
     """`differ.preview()` cuts Change values at 72 chars. The ellipsis means
     the path is incomplete — keeping its tail would expose `AppData` etc."""
     out = redact_text(
-        "Notes. Source: C:/Users/admin/AppData/Loc…",
-        root=r"C:\Users\admin\AppData\Local\Temp\vault",
+        "Notes. Source: C:/Users/alice/AppData/Loc…",
+        root=r"C:\Users\alice\AppData\Local\Temp\vault",
     )
     assert "AppData" not in out
-    assert "admin" not in out
+    assert "alice" not in out
     assert "…" in out
 
 
@@ -113,6 +113,27 @@ def test_redactor_keeps_truncated_quote_by_default():
     out = red.evidence([{"kind": "email", "ref": "msg-1", "quote": "y" * 400}])
     assert out[0]["quote"].endswith("…")
     assert len(out[0]["quote"]) <= QUOTE_LIMIT
+
+
+def test_a_quote_is_redacted_like_every_other_string():
+    """Quotes are verbatim evidence — and the likeliest place a path survives."""
+    red = Redactor(root="/home/alice/vault")
+    out = red.evidence(
+        [{
+            "kind": "email",
+            "ref": "msg-1",
+            "quote": r"see /home/alice/vault/clients/acme.md and C:\Users\bob\x.docx",
+        }]
+    )
+    quote = out[0]["quote"]
+    assert "alice" not in quote and "bob" not in quote
+    assert "see " in quote  # redacted, not dropped
+
+
+def test_quotes_can_still_be_dropped_entirely():
+    red = Redactor(root="/v", keep_quotes=False)
+    out = red.evidence([{"kind": "email", "ref": "m", "quote": "/home/alice/x"}])
+    assert out[0] == {"kind": "email", "ref": "m", "quote_omitted": True}
 
 
 def test_redactor_scrubs_change_paths_and_values():

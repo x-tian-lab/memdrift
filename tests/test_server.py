@@ -71,6 +71,23 @@ def test_no_absolute_paths_in_any_view(live, repo):
         assert str(repo.root) not in body, path
 
 
+def test_page_detail_redacts_a_value_that_is_a_path(live, repo, vault):
+    """A field value can be a pasted path; the digest redacts those."""
+    target = vault / "clients" / "acme.md"
+    target.write_text(
+        target.read_text(encoding="utf-8").replace(
+            "client: Acme", "client: Acme\nsource: 'C:\\Users\\alice\\notes.md'"
+        ),
+        encoding="utf-8",
+    )
+    ops.commit(repo, "add source")
+    base, token = live
+    status, body, _ = fetch(f"{base}/page/clients/acme.md?t={token}")
+    assert status == 200
+    assert "alice" not in body
+    assert "~/notes.md" in body
+
+
 def test_path_traversal_is_blocked(live):
     base, token = live
     status, _, _ = fetch(f"{base}/page/../../../../etc/passwd?t={token}")
@@ -90,6 +107,20 @@ def test_private_page_hidden_from_pages_view(live, repo, vault):
     base, token = live
     _, body, _ = fetch(f"{base}/pages?t={token}")
     assert "secret/d.md" not in body
+
+
+def test_private_page_cannot_be_opened_by_url(live, repo, vault):
+    """Omitting a page from the list is not the same as refusing to serve it."""
+    (vault / "secret").mkdir()
+    (vault / "secret" / "d.md").write_text(
+        "---\nprivate: true\ntitle: Diary\n---\n# D\n\n今日心情。\n", encoding="utf-8"
+    )
+    ops.commit(repo, "add private")
+    base, token = live
+    status, body, _ = fetch(f"{base}/page/secret/d.md?t={token}")
+    assert status == 403
+    assert "private" in body
+    assert "今日心情" not in body
 
 
 def test_quotes_can_be_disabled(live, repo, vault):
@@ -193,4 +224,31 @@ def test_cross_origin_request_is_rejected(repo):
         conn.close()
     finally:
         srv.shutdown()
+        srv.server_close()
+
+
+def test_a_client_that_leaves_mid_response_is_not_a_traceback(repo, capsys):
+    """Closing a tab must not print a traceback full of local paths."""
+    srv = server_mod.make_server(repo, port=0)
+    try:
+        try:
+            raise BrokenPipeError(32, "Broken pipe")
+        except BrokenPipeError:
+            srv.handle_error(None, ("127.0.0.1", 0))
+        assert capsys.readouterr().err == ""
+
+        try:
+            raise RuntimeError(f"cannot open {repo.root}/notes.md")
+        except RuntimeError:
+            srv.handle_error(None, ("127.0.0.1", 0))
+        err = capsys.readouterr().err
+        assert err == "memdrift: RuntimeError while answering a request\n"
+
+        srv.verbose = True
+        try:
+            raise RuntimeError("boom")
+        except RuntimeError:
+            srv.handle_error(None, ("127.0.0.1", 0))
+        assert "Traceback" in capsys.readouterr().err
+    finally:
         srv.server_close()

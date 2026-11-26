@@ -23,6 +23,13 @@ desktop.ini
 *.log
 demo-vault/
 
+# scratch vaults and homes used while taking screenshots
+.ui-demo/
+.ui-home/
+.demo-home/
+.demo-shared/
+.page.js
+
 # --- never commit credentials ---
 .env
 .env.*

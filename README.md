@@ -75,12 +75,21 @@ A terminal is a bad place to read your own biography. Two views, one data source
 
 **`memdrift serve`** opens a read-only local UI when you want to dig around instead of read a report.
 
+**`memdrift ui`** is the same three views with the two things a report cannot do: undo one field and commit the working tree. It never acts on the first click — the page fetches a plan, shows the before/after, and only then offers a confirm button, which sends back a fingerprint of exactly the plan you were shown. If the file moved in between, the write is refused with a 409 and you review again.
+
 ```bash
 memdrift -C ~/vault digest --since 1d -o morning.html
 memdrift -C ~/vault serve --open
+memdrift -C ~/vault ui --open          # writes; own port, own locks
 ```
 
-Both read the same redacted event stream, so they cannot disagree, and neither can forget to redact.
+All three read the same redacted event stream, so they cannot disagree, and none of them can forget to redact. `serve` stays read-only on purpose: the writable surface is a separate command with a separate server, so a read-only view can never grow a write path by accident.
+
+![memdrift ui: a timeline of commits on the left, the selected field's before/after, evidence and confidence on the right](docs/assets/11-ui.png)
+
+Clicking 撤销这一处 writes nothing. It fetches the plan first and puts the whole thing in front of you — what will change, what it will be restored to, and the fact that history is not rewritten:
+
+![the confirm box: 会新增一个 commit，历史不改写 … 恢复为 $45k](docs/assets/12-ui-undo.png)
 
 ### And from inside your editor
 
@@ -132,6 +141,71 @@ Two details that took a bug each to get right:
 
 `--dry-run` prints the plan and writes nothing. The MCP tool defaults to `dry_run: true` for the same reason.
 
+**Every undo gets its own id, and says whose id it is undoing.** The new commit carries `reverts: sha256:…` and a message ending in `(undoes 9f2c1ab)`; the original keeps its id, its tree and its place in the chain. You never have to guess what "the value came back" was a reaction to:
+
+```
+82c7723  revert: clients/globex.md · frontmatter.status (undoes d699e0d)
+d699e0d  手动改客户状态：Globex 已取消
+```
+
+In the web app, committing from the page opens the way back immediately — that is the point of a page you can write from:
+
+![after committing: 已提交 d699e0d · 1 处变化 / 撤销会再新增一个 commit，d699e0d 仍然留在历史里](docs/assets/13-undo-offer.png)
+
+Undoing asks once more, with the plan spelled out (`恢复为 on-hold`), and then appends rather than replaces:
+
+![the undo confirmation: 会新增一个 commit 把这次改动改回去，d699e0d 本身不删除、不改写](docs/assets/14-undo-confirm.png)
+
+![the result: 已撤销：新 commit 82c7723 记录了 reverts d699e0d，and both commits are in the timeline](docs/assets/15-undo-done.png)
+
+## Spaces: what this install is allowed to touch
+
+You have a personal vault. Your team has a shared one. A memory tool that can write to both, from any directory, with no notion of which is which, is a tool that will eventually write to the wrong one.
+
+So the boundary is hard-coded, not a setting:
+
+| Situation | What is allowed |
+|---|---|
+| Fresh install, no registry yet | **Read** the directory you run the command in. Nothing else. No writes at all |
+| `memdrift init ~/vault` | That directory becomes a **write** space — creating the store *is* the declaration |
+| `memdrift space allow ~/shared --read` | Someone else's vault: readable, still impossible to commit to |
+| `memdrift space allow ~/shared --write` | You are allowed to change it |
+| Anything else | Refused, with the exact command that would allow it |
+
+```bash
+memdrift space list
+memdrift space allow ~/team-memory --read
+memdrift space allow ~/team-memory --write
+memdrift space deny ~/team-memory
+```
+
+A refusal looks like this — and it has to, because a "no" that does not say how to proceed gets worked around by editing the source:
+
+```
+refused: /srv/shared/team-memory is read-only for this install
+  you may read: /srv/shared/team-memory
+  allow writes:  memdrift space allow /srv/shared/team-memory --write
+```
+
+Three things this deliberately does **not** offer: a `--allow-all` flag, an environment variable that turns the check off, and a registry inside the vault. The list lives in `~/.memdrift/spaces.json` — a vault you clone can carry its own `spaces.json` and it will be read as memory content, never as permission. `MEMDRIFT_HOME` moves the file; it cannot empty the rule.
+
+The check runs at every entry point: the CLI (`_open`), `serve` (read), `ui` (write, re-checked on every click so revoking a space takes effect without a restart), and the MCP server — where `memory.commit` and `memory.revert` are refused on a read-only space while `memory.history` keeps answering. A dry-run revert is a read, so it stays available.
+
+## 从零开始：点一遍就懂
+
+If you have never heard of memdrift and just want to find out what it is, don't read the docs — click through this:
+
+**打开 [`docs/onboarding.html`](docs/onboarding.html)**（双击，或在编辑器的预览面板里打开）。
+
+It is a 9-step clickable workflow that follows a user who knows nothing at all:
+
+> 它是什么 → 敢不敢指向我真正在乎的目录 → agent 半夜到底改了什么 → 我不想盯着终端
+> → 记错了怎么撤 → 能不能在编辑器里直接问 → 发出去会不会泄露 → 我现在全懂了
+
+左边九步可以乱跳，带下划线的词点开有名词解释，命令块点一下就复制，`←` `→` 翻页，还有个「🎲 随便跳一步」。最后一页是命令速查表和那三件还没做的事。
+
+Every terminal block in it is **real output**: `scripts/build_onboarding.py` builds a vault, commits, reverts, starts `serve`, and performs an actual MCP stdio handshake, then embeds what those processes printed. If a command breaks, the build breaks — no hand-drawn screens. `scripts/verify_onboarding.py` checks the result is offline/self-contained, free of machine paths, and still has all nine steps.
+
 ## Quickstart
 
 ```bash
@@ -155,6 +229,8 @@ Delete `.memgit/` and your memory is exactly as it was — history is lost, cont
 
 It is the only reason to point a tool at a directory you care about, so it is the one thing the tool refuses to get wrong.
 
+And it cannot write to a directory you did not declare. On a fresh install the only thing memdrift can do outside `memdrift init` is *read* the directory it was started in — see [Spaces](#spaces-what-this-install-is-allowed-to-touch).
+
 `init` and `status` look like this:
 
 ![memdrift init writing a baseline commit, then status listing a rename, a new page and two modified pages](docs/assets/01-init-status.png)
@@ -173,8 +249,12 @@ It is the only reason to point a tool at a directory you care about, so it is th
 | `memdrift -C <dir> status` | Uncommitted changes |
 | `memdrift -C <dir> digest [--since 1d] [--no-quote] [-o file]` | Self-contained HTML report, redacted by default |
 | `memdrift -C <dir> serve [--port 7787] [--open]` | Read-only local UI on 127.0.0.1, token in the URL |
+| `memdrift -C <dir> ui [--port 7788] [--open]` | The same views plus undo-one-field and commit, each behind a plan you approve |
 | `memdrift -C <dir> revert [--field f] [--page p] [--commit c] [--dry-run]` | Undo as a new commit; history is never rewritten |
 | `memdrift -C <dir> mcp [--print-config] [--no-quote]` | Serve this directory over MCP (stdio) |
+| `memdrift space list` | Directories this install may read or write |
+| `memdrift space allow <dir> [--write]` | Declare one (read-only unless `--write`) |
+| `memdrift space deny <dir>` | Forget one |
 | `memdrift -C <dir> index --rebuild` | Rebuild the SQLite index from commit files |
 
 Add `--json` to `log`, `diff`, `show`, `blame`, `status`, `commit`, `revert` for machine output.
@@ -188,7 +268,8 @@ A memory directory is a biography. The moment you paste a digest into a group ch
 | **Machine paths** | `C:\Users\alice\vault\a.md` → `~/clients/a.md`. The root is stripped everywhere: change lists, evidence refs, MCP tool output. A path that is *not* under the root keeps only its last two segments, so `AppData/Local/...` never survives. |
 | **Pasted paths inside values** | A path in the middle of a sentence is redacted too, not just one at position 0. Values are stored as 72-char previews, so a path cut mid-directory is replaced wholesale rather than half-guessed. |
 | **Verbatim quotes** | Truncated to 120 chars with a `…`. `--no-quote` keeps the reference (`email:msg-1882`) and drops the text. |
-| **Private pages** | `private: true` in frontmatter removes the page *and every evidence entry pointing at it* — otherwise the leak just moves one hop. `memory.page` refuses such a page outright. |
+| **Private pages** | `private: true` in frontmatter removes the page *and every evidence entry pointing at it* — otherwise the leak just moves one hop. Every surface that can be handed a page name (`memory.page`, `memory.blame`, `memory.history`, `memory.diff`, `memory.revert`, `/page/<path>` on `serve`, the undo endpoint on `ui`) refuses one, and a commit message that spells the path out is masked to `(private)`. |
+| **Commit messages** | A message is free text, and agents paste paths into free text. It goes through the same redactor as every value, so `C:\Users\alice\…` in a message becomes `~/…` in the digest, the MCP answer and the web UI. |
 | **Escaping** | All memory text is HTML-escaped; a page whose title is `<script>` renders as text. |
 | **`serve` binding** | Loopback only. `--host 0.0.0.0` is refused by design, not by config. |
 | **CSRF / DNS rebinding** | A per-process random token in the URL, plus a `Host` whitelist and an `Origin` match. A page that rebinds `evil.test` to 127.0.0.1 gets 403 even with a valid token. |
@@ -244,7 +325,7 @@ When heading structure collapses (a page gets rewritten wholesale), attribution 
     index.sqlite          # rebuildable cache
 ```
 
-Code: `repo` (objects, refs) · `differ` (field-level diff) · `events` (the one stream) · `security` (redaction) · `digest` / `server` (the two views) · `revert` (undo) · `rpc` / `mcp` (the agent channel).
+Code: `repo` (objects, refs) · `differ` (field-level diff) · `events` (the one stream) · `security` (redaction) · `scope` (which directories may be touched, and how) · `digest` / `server` (read-only views) · `gui` (`memdrift ui`, the one writable surface) · `revert` (undo) · `rpc` / `mcp` (the agent channel).
 
 ## Development
 
@@ -254,15 +335,29 @@ python -m venv .venv && .venv/bin/pip install -e ".[docs]"
 .venv/bin/pytest -q
 .venv/bin/python scripts/render_terminal_shots.py   # regenerates docs/assets
 .venv/bin/python scripts/smoke_serve.py             # drives serve over real HTTP
+.venv/bin/python scripts/build_onboarding.py        # regenerates docs/onboarding.html
+.venv/bin/python scripts/verify_onboarding.py       # checks the tour is real & offline
 ```
 
 Every screenshot in this README is produced by that last command: it builds a demo vault, runs the real binary, and fails loudly if any command does. There is no hand-edited output anywhere in the images.
 
+## Not done yet
+
+Four things are missing. They are written down here rather than quietly skipped, because each one changes what you can safely assume.
+
+**1. Concurrent writers.** `.memgit/refs/head` is a single file with no lock, so the current model is **one writer, many readers**. Two agents committing at the same instant can lose one of the commits — the second reads HEAD, writes its commit, and overwrites the ref the first just moved. Until there is a lock, `watch` is the intended path: it serialises a burst of writes into one commit. Nothing in the code pretends this is safe; there is no optimistic retry and no merge.
+
+**2. A rules engine, multi-vault aggregation, and cross-system conflict detection (v1.1).** memdrift records *what changed* and *why it says it did*. It does not judge whether a change should have happened, it cannot join the histories of two memory directories, and it will not notice that Hindsight and mem0 disagree about the same fact. Those are the interesting next questions; they are not in v0.1.
+
+**3. Full `--exclude` glob semantics.** The current matcher handles `**/name/**` by directory name — enough to keep `node_modules` and `.venv` out of a snapshot — but it is not gitignore syntax. Nested negations, character classes and anchored patterns do not behave the way a git user would expect.
+
+**4. Spaces are per-machine, not per-person.** `~/.memdrift/spaces.json` says what *this install* may touch; it has no idea who is sitting in front of it. Two people on one account share one list. That is the honest limit of a local single-user tool: it stops an agent from wandering into the wrong directory, it does not stop a colleague at your keyboard. Real multi-user separation needs the OS (separate accounts, file permissions) — that is what those are for.
+
+Encryption is deliberately *not* on this list: it is a decision, not a gap (see `docs/DESIGN.md` §9.6).
+
 ## Status
 
-v0.1, week 3 of the plan: `init · watch · commit · log · diff · show · blame · status · digest · serve · revert · mcp` all work on a real directory, and 174 tests pass. Nothing here is stable enough to embed yet.
-
-Known gap: `.memgit/refs/head` is a single file with no lock, so it is **one writer, many readers**. Two agents committing at the same instant can lose a commit. `watch` is the intended path — it serialises a burst into one commit — but true concurrent writers need a lock, and faking one would be worse than saying so.
+v0.1, week 3 of the plan: `init · watch · commit · log · diff · show · blame · status · digest · serve · ui · revert · mcp` all work on a real directory, and 290 tests pass. Nothing here is stable enough to embed yet.
 
 Requirements: Python 3.11+, macOS / Linux / Windows. Three dependencies: `click`, `python-frontmatter`, `watchdog`. The MCP server is stdlib-only — it does not need the official SDK, and a JSON-RPC layer we can read in one sitting beats a dependency that breaks in someone else's editor.
 

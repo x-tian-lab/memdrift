@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import secrets
+import sys
 import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -317,7 +318,7 @@ class _Handler(BaseHTTPRequestHandler):
     def _page_detail(self, raw_path: str, query: dict) -> bytes:
         from urllib.parse import unquote
 
-        from .events import human_time
+        from .events import human_time, is_private_page
         from .operations import blame
 
         target = unquote(raw_path)
@@ -326,13 +327,24 @@ class _Handler(BaseHTTPRequestHandler):
         if self.repo.root not in resolved.parents and resolved != self.repo.root:
             self._deny(HTTPStatus.FORBIDDEN, "path outside memory root")
             return b""
+        # The page list omits private pages, but a typed URL still has to be
+        # refused: excluding a page from an index is not the same as refusing
+        # to answer for it.
+        if is_private_page(self.repo, target):
+            self._deny(HTTPStatus.FORBIDDEN, "this page is marked private")
+            return b""
         redactor = self._redactor(query)
         entries = blame(self.repo, target)
         rows = []
         for entry in entries:
+            # Values are memory content, but a value can be a pasted absolute
+            # path ("source: C:\Users\alice\…"). The digest redacts those; a
+            # view that does not would be the one place the username escapes.
+            before = redactor.text(entry.get("before"))
+            after = redactor.text(entry.get("after"))
             delta = ""
-            if entry.get("before") is not None or entry.get("after") is not None:
-                delta = f'{_esc(entry.get("before"))} → <b>{_esc(entry.get("after"))}</b>'
+            if before is not None or after is not None:
+                delta = f'{_esc(before)} → <b>{_esc(after)}</b>'
             else:
                 delta = f'<b>{_esc(entry.get("op"))}</b>'
             rows.append(
@@ -358,6 +370,23 @@ class Server(ThreadingHTTPServer):
         self.repo = repo
         self.token = token
         self.verbose = verbose
+
+    def handle_error(self, request, client_address) -> None:
+        """A browser that closes the tab mid-response is not an incident.
+
+        ``socketserver`` prints a full traceback for any exception raised in a
+        handler, including the very ordinary BrokenPipeError of a client that
+        navigated away. That noise trains people to ignore the terminal, and a
+        traceback also spells out local paths. So: drop disconnects, and for
+        anything else print one line (the traceback only under ``--verbose``).
+        """
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError)):
+            return
+        if self.verbose:
+            super().handle_error(request, client_address)
+        else:
+            sys.stderr.write(f"memdrift: {type(exc).__name__} while answering a request\n")
 
 
 def make_server(repo: Repo, host: str = LOOPBACK, port: int = 0, verbose: bool = False) -> Server:

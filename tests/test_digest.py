@@ -26,6 +26,23 @@ def test_no_absolute_paths(repo):
     assert str(repo.root) not in html
 
 
+def test_commit_message_is_redacted_too(repo, vault):
+    """The digest is the file you hand to a client. So is the message in it.
+
+    A message is free text an agent wrote; agents paste paths into messages,
+    and a message is rendered at the top of every commit card.
+    """
+    (vault / "clients" / "acme.md").write_text(
+        (vault / "clients" / "acme.md").read_text(encoding="utf-8") + "\n", encoding="utf-8"
+    )
+    ops.commit(repo, r"extracted from C:\Users\alice\vault\clients\acme.md")
+
+    html = _render(repo)
+    assert "alice" not in html
+    assert "C:/Users" not in html and "C:\\Users" not in html
+    assert "extracted from" in html  # redacted, not dropped
+
+
 def test_shows_field_level_change(repo, vault):
     text = (vault / "clients" / "acme.md").read_text(encoding="utf-8").replace("$45k", "$48k")
     (vault / "clients" / "acme.md").write_text(text, encoding="utf-8")

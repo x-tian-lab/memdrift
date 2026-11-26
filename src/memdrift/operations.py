@@ -84,6 +84,7 @@ def commit(
     author_name: str | None = None,
     confidence: float | None = None,
     update_index: bool = True,
+    reverts: str | None = None,
 ) -> dict | None:
     """Snapshot, diff against HEAD, write a commit. Returns None if nothing changed."""
     new_tree = repo.snapshot()
@@ -106,6 +107,7 @@ def commit(
         author=author,
         evidence=parse_evidence(evidence),
         confidence=confidence,
+        reverts=reverts,
     )
     if update_index:
         index = open_index(repo)

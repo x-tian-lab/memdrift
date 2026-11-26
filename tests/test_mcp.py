@@ -201,6 +201,132 @@ def test_path_traversal_is_refused(vault):
     assert "escapes" in err["message"]
 
 
+def test_private_page_is_refused_by_every_named_lookup(vault):
+    """One marker, one rule — on every tool that can be pointed at a path.
+
+    ``events.build`` drops private pages from list-shaped answers, so a tool
+    that takes a page name has to ask again. ``memory.blame`` used to answer
+    for a private page with its field values.
+    """
+    from click.testing import CliRunner
+
+    from memdrift.cli import main
+
+    CliRunner().invoke(main, ["init", str(vault)])
+    (vault / "secret.md").write_text(
+        "---\nprivate: true\nsalary: 999\n---\n# Diary\n\n今日心情。\n", encoding="utf-8"
+    )
+    CliRunner().invoke(main, ["-C", str(vault), "commit", "-m", "add diary"])
+
+    client = open_client(vault)
+    try:
+        for tool, args in (
+            ("memory.blame", {"page": "secret.md"}),
+            ("memory.history", {"page": "secret.md"}),
+            ("memory.page", {"page": "secret.md"}),
+            ("memory.revert", {"page": "secret.md", "field": "frontmatter.salary"}),
+        ):
+            err = client.error(tool, **args)
+            assert "private" in err["message"], (tool, err)
+            assert "999" not in json.dumps(err), tool
+    finally:
+        client.close()
+
+
+def test_diff_drops_private_pages_and_says_how_many(vault):
+    from click.testing import CliRunner
+
+    from memdrift.cli import main
+
+    CliRunner().invoke(main, ["init", str(vault)])
+    (vault / "secret.md").write_text(
+        "---\nprivate: true\nsalary: 999\n---\n# Diary\n\nv1\n", encoding="utf-8"
+    )
+    CliRunner().invoke(main, ["-C", str(vault), "commit", "-m", "add diary"])
+    (vault / "secret.md").write_text(
+        "---\nprivate: true\nsalary: 1234\n---\n# Diary\n\nv2\n", encoding="utf-8"
+    )
+    acme = vault / "clients" / "acme.md"
+    acme.write_text(acme.read_text(encoding="utf-8").replace('"$45k"', '"$48k"'), encoding="utf-8")
+    CliRunner().invoke(main, ["-C", str(vault), "commit", "-m", "quiet raise"])
+
+    client = open_client(vault)
+    try:
+        result = client.call("memory.diff")
+    finally:
+        client.close()
+    blob = json.dumps(result, ensure_ascii=False)
+    assert "secret.md" not in blob
+    assert "1234" not in blob
+    assert result["hidden"] >= 1
+    assert any(c["path"] == "clients/acme.md" for c in result["changes"])
+
+
+def test_history_does_not_name_a_private_page(vault):
+    """Two shapes of the same leak: the whole commit, and the message.
+
+    A commit that only touched private pages is not history a reader may see;
+    a mixed commit stays, but its message must not spell the private path.
+    """
+    from click.testing import CliRunner
+
+    from memdrift.cli import main
+
+    CliRunner().invoke(main, ["init", str(vault)])
+
+    (vault / "secret.md").write_text(
+        "---\nprivate: true\nsalary: 999\n---\n# Diary\n\nv1\n", encoding="utf-8"
+    )
+    CliRunner().invoke(main, ["-C", str(vault), "commit", "-m", "only the diary"])
+
+    (vault / "secret.md").write_text(
+        "---\nprivate: true\nsalary: 1234\n---\n# Diary\n\nv2\n", encoding="utf-8"
+    )
+    acme = vault / "clients" / "acme.md"
+    acme.write_text(acme.read_text(encoding="utf-8").replace('"$45k"', '"$48k"'), encoding="utf-8")
+    CliRunner().invoke(
+        main, ["-C", str(vault), "commit", "-m", "raise price; also secret.md"]
+    )
+
+    client = open_client(vault)
+    try:
+        result = client.call("memory.history", limit=10)
+    finally:
+        client.close()
+
+    blob = json.dumps(result, ensure_ascii=False)
+    assert "secret.md" not in blob
+    assert "only the diary" not in blob
+    assert result["hidden_commits"] == 1
+    assert "(private)" in result["commits"][0]["message"]
+    assert "raise price" in result["commits"][0]["message"]
+
+
+def test_commit_message_is_redacted_like_every_other_string(vault):
+    """A message is free text; agents paste paths into it."""
+    from click.testing import CliRunner
+
+    from memdrift.cli import main
+
+    CliRunner().invoke(main, ["init", str(vault)])
+    acme = vault / "clients" / "acme.md"
+    acme.write_text(acme.read_text(encoding="utf-8").replace('"$45k"', '"$48k"'), encoding="utf-8")
+    leaky = r"raise, see C:\Users\alice\vault\clients\acme.md"
+    CliRunner().invoke(main, ["-C", str(vault), "commit", "-m", leaky])
+
+    client = open_client(vault)
+    try:
+        history = client.call("memory.history", limit=1)
+        digest = client.call("memory.digest")
+    finally:
+        client.close()
+
+    for payload in (history, digest):
+        blob = json.dumps(payload, ensure_ascii=False)
+        assert "alice" not in blob, payload
+        assert "C:/Users" not in blob and "C:\\Users" not in blob
+
+
 def test_commit_is_a_writer_and_reports_nothing_to_do(vault):
     from click.testing import CliRunner
 

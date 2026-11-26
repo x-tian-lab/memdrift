@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import shutil
 
+import pytest
+
 from memdrift import operations as ops
-from memdrift.repo import Repo, short
+from memdrift.repo import Repo, RepoError, short
 
 
 def test_init_creates_meta_dir(vault):
@@ -24,6 +26,21 @@ def test_first_commit_is_the_root(repo):
     assert commit["parent"] is None
     assert commit["author"]["type"] == "human"
     assert len(commit["changes"]) == 2  # two pages added
+
+
+@pytest.mark.parametrize(
+    "ref",
+    ["../../../../etc/passwd", "..", "sha256:../../x", "abc/def", ""],
+)
+def test_a_ref_that_is_not_a_commit_id_never_touches_the_disk(repo, ref):
+    """``commit_path`` builds a path out of whatever it is handed.
+
+    A ref reaches this from an MCP client, so it is untrusted input like any
+    other, and ``"../.."`` must be rejected before it becomes a filesystem
+    path rather than after the file fails to exist.
+    """
+    with pytest.raises(RepoError):
+        repo.read_commit(ref)
 
 
 def test_commit_chain_links_parent(repo, vault):

@@ -153,7 +153,15 @@ class Redactor:
                 "ref": redact_text(ref, root=self.root) if self.enabled else ref,
             }
             if self.keep_quotes and item.get("quote"):
-                clean["quote"] = truncate_quote(str(item["quote"]), self.quote_limit)
+                # A quote is verbatim evidence, but it is also the most likely
+                # place for a pasted path to survive: an email signature, a
+                # ticket URL. Redacting it keeps the promise every other
+                # string here already keeps; ``--no-quote`` is still the way
+                # to drop the text entirely.
+                quote = str(item["quote"])
+                if self.enabled:
+                    quote = redact_text(quote, root=self.root) or ""
+                clean["quote"] = truncate_quote(quote, self.quote_limit)
             elif not self.keep_quotes and item.get("quote"):
                 clean["quote_omitted"] = True
             out.append(clean)

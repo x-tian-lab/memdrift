@@ -118,6 +118,60 @@ def collect_pages(repo: Repo) -> dict[str, PageInfo]:
     return pages
 
 
+def private_paths(repo: Repo) -> set[str]:
+    """Pages marked private in the last commit (one tree walk)."""
+    return {path for path, info in collect_pages(repo).items() if info.private}
+
+
+def is_private_page(repo: Repo, path: str) -> bool:
+    """Is *this* page private — in the last commit, or in the file on disk now?
+
+    ``build`` already drops private pages while walking history, but that is
+    not the same as "unreachable by name". Any surface that can be asked for
+    one page directly (blame, a page detail URL, a revert) has to ask this
+    separately, or the exclusion holds only for the list view and leaks the
+    moment someone spells the path.
+
+    The on-disk half matters because a page the agent wrote since the last
+    commit is not in any snapshot yet, but is already marked private.
+    """
+    if not path:
+        return False
+    if repo.head():
+        blob = repo.head_tree().get(path)
+        if blob:
+            try:
+                if is_private(parse_page(path, repo.read_blob_text(blob) or "").fields):
+                    return True
+            except Exception:  # unreadable snapshot: fall through to disk
+                pass
+    target = repo.root / path
+    try:
+        if target.is_file():
+            return is_private(parse_page(path, target.read_text(encoding="utf-8")).fields)
+    except (OSError, ValueError):
+        return False
+    return False
+
+
+def mask_private(text: str | None, paths: set[str]) -> str | None:
+    """Replace mentions of a private page's path with ``(private)``.
+
+    Dropping the private *changes* is not enough: a commit can touch a public
+    page and a private one in the same breath, and its message or an evidence
+    ref can spell the private path out. The page must not be nameable from any
+    answer, so the name is masked wherever free text survives.
+
+    Longest first: ``clients/acme-archive.md`` before ``clients/acme.md``.
+    """
+    if not text or not paths or not isinstance(text, str):
+        return text
+    for path in sorted(paths, key=len, reverse=True):
+        if path and path in text:
+            text = text.replace(path, "(private)")
+    return text
+
+
 def build(
     repo: Repo,
     *,
@@ -174,11 +228,24 @@ def build(
                     "ts": ts,
                     "author": {
                         "type": author.get("type") or "unknown",
-                        "name": author.get("name") or "unknown",
+                        # An author name is free text too — an agent configured
+                        # with a full path as its name would leak it the same
+                        # way a message would.
+                        "name": mask_private(
+                            redactor.text(author.get("name") or "unknown"), private_paths
+                        ),
                     },
-                    "message": item.get("message") or "",
+                    "message": mask_private(
+                        redactor.text(item.get("message") or ""), private_paths
+                    ),
                     "evidence": redactor.evidence(item.get("evidence")),
                     "confidence": item.get("confidence"),
+                    # ``reverts`` is a forward pointer written on the undo
+                    # commit. Both ids are shown, because the useful sentence
+                    # is "this commit undoes 9f2c1ab" and neither half of it
+                    # may be dropped to save space.
+                    "reverts": item.get("reverts"),
+                    "reverts_short": short(item["reverts"]) if item.get("reverts") else None,
                 }
             )
             clean["risk"] = _flag_risk(change.op, change.change_ratio, thresholds)

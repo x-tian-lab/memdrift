@@ -68,6 +68,35 @@ def test_revert_is_append_only(vault):
     assert pricing["after"] == "$12k"
 
 
+def test_the_revert_names_the_commit_it_undoes(vault):
+    """A new id every time, and a pointer back — that is the whole promise.
+
+    Without the pointer, "this value came back" is a fact with no cause: you
+    can see the undo commit but not which change it was undoing.
+    """
+    run("init", str(vault))
+    acme = vault / "clients" / "acme.md"
+    acme.write_text(acme.read_text(encoding="utf-8").replace('"$45k"', '"$12k"'), encoding="utf-8")
+    run("-C", str(vault), "commit", "-m", "extract: pricing")
+    bad = _log(vault)[0]["id"]
+
+    out = run(
+        "-C", str(vault), "revert",
+        "--field", "frontmatter.pricing",
+        "--page", "clients/acme.md",
+    ).output
+
+    undo = _log(vault)[0]
+    assert undo["id"] != bad
+    assert undo["reverts"] == bad
+    assert undo["message"] == f"revert: clients/acme.md · frontmatter.pricing (undoes {bad[7:14]})"
+    # said out loud in the terminal too, not only in the json
+    assert "undoes" in out and "still in history" in out
+    # and the id nobody is allowed to erase is still there, still readable
+    assert _log(vault)[1]["id"] == bad
+    assert json.loads(run("-C", str(vault), "show", bad, "--json").output)["id"] == bad
+
+
 def test_revert_dry_run_writes_nothing(vault):
     run("init", str(vault))
     acme = vault / "clients" / "acme.md"

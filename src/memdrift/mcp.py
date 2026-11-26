@@ -33,9 +33,10 @@ from typing import Any
 
 from . import operations as ops
 from .differ import Change
+from .events import is_private_page, mask_private, private_paths
 from .parse import parse_page
 from .repo import Repo, RepoError, short
-from .rpc import INVALID_PARAMS, RpcError
+from .rpc import FORBIDDEN, INVALID_PARAMS, RpcError
 from .rpc import Server as RpcServer
 from .security import Redactor, is_private
 
@@ -102,6 +103,20 @@ class Toolbox:
             raise RpcError(INVALID_PARAMS, f"path escapes the memory root: {raw}")
         return candidate.relative_to(self.repo.root).as_posix()
 
+    def _require_write(self) -> None:
+        """The write tools ask the scope, not the caller, for permission.
+
+        An agent that was handed a shell is still not the operator: the space
+        list is what decides, and it is re-read on every write so revoking a
+        space takes effect without restarting the server.
+        """
+        from . import scope
+
+        try:
+            scope.check(self.repo.root, write=True)
+        except scope.OutOfScope as exc:
+            raise RpcError(FORBIDDEN, str(exc)) from exc
+
     def _commit(self, ref: str | None) -> str | None:
         if ref is None:
             return None
@@ -115,12 +130,37 @@ class Toolbox:
         blob = tree.get(path)
         return self.repo.read_blob_text(blob) if blob else None
 
+    def _refuse_private(self, page: str | None) -> None:
+        """A private page is not served, and "served" includes blame/diff/revert.
+
+        ``events.build`` drops private pages, which protects every *list*
+        surface. A tool that takes a path is different: it can be pointed at a
+        page that no list mentions, so the rule has to be asked again here.
+        Without this, ``memory.blame`` on a page marked private returns its
+        field values — the exact leak the marker exists to prevent.
+        """
+        if page and is_private_page(self.repo, page):
+            raise RpcError(INVALID_PARAMS, f"{page} is marked private")
+
     # ----------------------------------------------------------------- tools
 
     def history(self, params: dict) -> dict:
         page = self._page(params.get("page"))
+        self._refuse_private(page)
         limit = int(params.get("limit") or 20)
         rows = ops.log(self.repo, page=page, since=params.get("since"), limit=limit)
+        hidden = private_paths(self.repo)
+        kept: list[dict] = []
+        hidden_commits = 0
+        for row in rows:
+            touched = {c.get("path") for c in row.get("changes") or []} - {None}
+            if touched and touched <= hidden:
+                # A commit that only touched private pages is not history a
+                # reader of this vault is allowed to see. Counted, not hidden
+                # silently — "no commits" and "all private" differ.
+                hidden_commits += 1
+                continue
+            kept.append(row)
         return {
             "commits": [
                 {
@@ -129,29 +169,37 @@ class Toolbox:
                     "ts": c.get("ts"),
                     # The log index returns flat columns; do not invent a
                     # nested `author` key that only some callers have.
-                    "author": f"{c.get('author_type')}:{c.get('author_name')}",
+                    "author": f"{c.get('author_type')}:{mask_private(c.get('author_name'), hidden)}",
                     "author_type": c.get("author_type"),
-                    "author_name": c.get("author_name"),
-                    "message": c.get("message"),
+                    "author_name": mask_private(self.redactor.text(c.get("author_name")), hidden),
+                    "message": mask_private(self.redactor.text(c.get("message")), hidden),
                     "confidence": c.get("confidence"),
                     "evidence": self.redactor.evidence(_as_dicts(c.get("evidence"))),
                     "changed": len(c.get("changes") or []),
+                    # Present only on an undo commit; the pair (this id, that
+                    # id) is what makes "who erased it" answerable without
+                    # either commit being rewritten.
+                    "reverts": short(c.get("reverts")) if c.get("reverts") else None,
                 }
-                for c in rows
+                for c in kept
             ],
             "page": page,
+            "hidden_commits": hidden_commits,
         }
 
     def blame(self, params: dict) -> dict:
         page = self._page(params.get("page"))
         if not page:
             raise RpcError(INVALID_PARAMS, "page is required")
+        self._refuse_private(page)
         entries = ops.blame(self.repo, page)
         if not entries:
             raise RpcError(INVALID_PARAMS, f"no history for {page}")
+        hidden = private_paths(self.repo)
         for entry in entries:
             entry["before"] = self.redactor.text(entry.get("before"))
             entry["after"] = self.redactor.text(entry.get("after"))
+            entry["message"] = mask_private(self.redactor.text(entry.get("message")), hidden)
             entry["evidence"] = self.redactor.evidence(_as_dicts(entry.get("evidence")))
         return {"page": page, "fields": entries}
 
@@ -162,31 +210,58 @@ class Toolbox:
         head = self.repo.head()
         if to is None and from_ is None:
             if not head:
-                return {"from": None, "to": None, "changes": []}
+                return {"from": None, "to": None, "changes": [], "hidden": 0}
             payload = self.repo.read_commit(head)
             from_ = self.repo.resolve(payload.get("parent"))
             to = head
             if not from_:
                 changes = [Change.from_dict(c) for c in payload.get("changes") or []]
+                public, hidden = self._public(changes)
                 return {
                     "from": None,
                     "to": short(to),
-                    "changes": [_change_json(c, self.redactor) for c in changes],
+                    "changes": [_change_json(c, self.redactor) for c in public],
+                    "hidden": hidden,
                 }
         if to is None or from_ is None:
             raise RpcError(INVALID_PARAMS, "give both `from` and `to`, or neither")
-        changes = ops.diff_commits(self.repo, from_, to)
+        changes, hidden = self._public(ops.diff_commits(self.repo, from_, to))
         return {
             "from": short(from_),
             "to": short(to),
             "changes": [_change_json(c, self.redactor) for c in changes],
+            # Reported, not silently dropped: a diff that hides rows and says
+            # nothing would read as "this commit only touched what you see".
+            "hidden": hidden,
         }
+
+    def _public(self, changes: list[Change]) -> tuple[list[Change], int]:
+        """Split out changes belonging to private pages.
+
+        Unlike a list view, a diff is *about* specific paths, so filtering has
+        to happen before rendering and the count has to be reported: the
+        caller must be able to tell "nothing happened" from "what happened is
+        private".
+        """
+        hidden_paths = private_paths(self.repo)
+        if not hidden_paths:
+            return changes, 0
+        public: list[Change] = []
+        dropped = 0
+        for change in changes:
+            touched = {change.path, change.rename_from} - {None}
+            if touched & hidden_paths:
+                dropped += 1
+            else:
+                public.append(change)
+        return public, dropped
 
     def page_at(self, params: dict) -> dict:
         """Read a page as it was at a commit. The retrieval primitive."""
         page = self._page(params.get("page"))
         if not page:
             raise RpcError(INVALID_PARAMS, "page is required")
+        self._refuse_private(page)
         commit = params.get("commit")
         commit_id = self._commit(commit) if commit else self.repo.head()
         if not commit_id:
@@ -230,6 +305,7 @@ class Toolbox:
 
     def commit(self, params: dict) -> dict:
         """Write tool: snapshot the working tree into a commit."""
+        self._require_write()
         message = (params.get("message") or "").strip()
         if not message:
             raise RpcError(INVALID_PARAMS, "message is required — an unexplained commit is useless")
@@ -265,6 +341,9 @@ class Toolbox:
                 INVALID_PARAMS,
                 "say what to revert: field+page, page+commit, or commit",
             )
+        # A revert answers with before/after values, so it is a read as well
+        # as a write: the private-page rule applies to both halves.
+        self._refuse_private(page)
         if commit_ref:
             commit_ref = self._commit(commit_ref)
         try:
@@ -273,8 +352,16 @@ class Toolbox:
             )
         except RepoError as exc:
             raise RpcError(INVALID_PARAMS, str(exc)) from exc
+        if any(is_private_page(self.repo, p.path) for p in plans if p.path):
+            # `--commit` can name a commit that touched a private page even
+            # when no page was given.
+            raise RpcError(INVALID_PARAMS, "this change touches a page marked private")
 
         dry_run = bool(params.get("dry_run", True))  # safe default: look first
+        if not dry_run:
+            # A dry run is a read and stays available on a read-only space; the
+            # apply is what needs the operator's permission.
+            self._require_write()
         result = revert_mod.execute(self.repo, plans, dry_run=dry_run)
         return {
             "dry_run": dry_run,
@@ -291,6 +378,7 @@ class Toolbox:
                 for p in plans
             ],
             "commit": short(result.commit["id"]) if result.commit else None,
+            "reverts": short(result.commit.get("reverts")) if result.commit else None,
             "written": result.written,
         }
 

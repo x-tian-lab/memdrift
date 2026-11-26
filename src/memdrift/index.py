@@ -26,7 +26,8 @@ CREATE TABLE IF NOT EXISTS commits (
     confidence   REAL,
     evidence     TEXT,
     tree         TEXT,
-    seq          INTEGER
+    seq          INTEGER,
+    reverts      TEXT
 );
 CREATE TABLE IF NOT EXISTS changes (
     commit_id      TEXT NOT NULL,
@@ -47,7 +48,7 @@ CREATE INDEX IF NOT EXISTS ix_commits_ts ON commits(ts_epoch);
 SINCE_RE = re.compile(r"^(\d+)\s*([dhmw])$", re.IGNORECASE)
 UNIT_SECONDS = {"h": 3600, "d": 86400, "w": 604800, "m": 2592000}
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def parse_since(text: str | None) -> float | None:
@@ -130,7 +131,7 @@ class Index:
         cur.execute(
             "INSERT OR REPLACE INTO commits "
             "(id, parent, ts, ts_epoch, author_type, author_name, message, "
-            " confidence, evidence, tree, seq) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            " confidence, evidence, tree, seq, reverts) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 commit["id"],
                 commit.get("parent"),
@@ -143,6 +144,7 @@ class Index:
                 json.dumps(commit.get("evidence") or [], ensure_ascii=False),
                 commit.get("tree"),
                 seq,
+                commit.get("reverts"),
             ),
         )
         cur.execute("DELETE FROM changes WHERE commit_id = ?", (commit["id"],))

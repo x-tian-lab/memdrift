@@ -29,6 +29,15 @@ INVALID_REQUEST = -32600
 METHOD_NOT_FOUND = -32601
 INVALID_PARAMS = -32602
 INTERNAL_ERROR = -32603
+#: Not a JSON-RPC code: the request was well formed and the tool exists, but
+#: this install may not write here. Kept in the server-error range so clients
+#: that only understand the standard codes still show it as an error.
+FORBIDDEN = -32003
+
+#: A frame is a tool call, not a file. 8 MiB is far above any real request
+#: (the largest thing we accept is a diff window) and far below "let the
+#: client allocate whatever it likes on our heap".
+MAX_FRAME = 8 * 1024 * 1024
 
 
 class RpcError(Exception):
@@ -62,6 +71,11 @@ def _read_framed(stream, first_line: bytes) -> dict | None:
         line = stream.readline()
     if length is None:
         return None
+    if length < 0 or length > MAX_FRAME:
+        # Raised (not returned as None): None means EOF, and an oversized
+        # frame must be answered with an error, not by hanging up on the
+        # client mid-conversation.
+        raise ValueError(f"frame too large: {length} bytes (max {MAX_FRAME})")
     body = stream.read(length)
     if not body:
         return None
@@ -71,9 +85,13 @@ def _read_framed(stream, first_line: bytes) -> dict | None:
 def read_message(stream) -> tuple[dict | None, str]:
     """Read one message; return ``(payload, framing)``. ``payload`` None = EOF."""
     while True:
-        line = stream.readline()
+        # Bounded for the same reason as framed reads: one line is one
+        # request, and an unbounded readline() is an unbounded allocation.
+        line = stream.readline(MAX_FRAME)
         if not line:
             return None, "eof"
+        if not line.endswith(b"\n") and len(line) >= MAX_FRAME:
+            raise ValueError(f"line too long (max {MAX_FRAME} bytes)")
         stripped = line.strip()
         if not stripped:
             continue
@@ -139,7 +157,10 @@ class Server:
         except RpcError as exc:
             return _error(req_id, exc.code, exc.message, exc.data)
         except Exception as exc:  # a tool crash must not kill the server
-            return _error(req_id, INTERNAL_ERROR, f"{type(exc).__name__}: {exc}")
+            # Class name only. An OSError message routinely contains the
+            # absolute path it failed on, and that path is exactly what every
+            # other layer in this project is busy redacting.
+            return _error(req_id, INTERNAL_ERROR, type(exc).__name__)
         return {"jsonrpc": "2.0", "id": req_id, "result": result}
 
     def _dispatch(self, method: str, params: dict) -> Any:
@@ -165,7 +186,7 @@ class Server:
         while True:
             try:
                 request, framing = read_message(stdin)
-            except (json.JSONDecodeError, UnicodeDecodeError):
+            except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
                 write_message(stdout, _error(None, PARSE_ERROR, "bad frame"))
                 continue
             if request is None:

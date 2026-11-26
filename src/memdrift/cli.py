@@ -9,6 +9,7 @@ memory directory. Only ``init`` takes a positional path.
 
 from __future__ import annotations
 
+import importlib
 import json
 from datetime import datetime
 from pathlib import Path
@@ -26,11 +27,24 @@ CONTEXT_SETTINGS = {"help_option_names": ["-h", "--help"], "max_content_width": 
 # --------------------------------------------------------------------- helpers
 
 
-def _open(directory: str) -> Repo:
+def _open(directory: str, *, write: bool = False) -> Repo:
+    """Resolve the repository *and* the right to touch it.
+
+    Two separate refusals, deliberately: "not a repository" is about the
+    directory, "outside your allowed spaces" is about this install. Merging
+    them would let a scope refusal read like a typo.
+    """
+    from . import scope
+
     try:
-        return Repo.discover(directory)
+        repo = Repo.discover(directory)
     except RepoError as exc:
         raise click.ClickException(str(exc)) from exc
+    try:
+        scope.check(repo.root, write=write)
+    except scope.OutOfScope as exc:
+        raise click.ClickException(str(exc)) from exc
+    return repo
 
 
 def _fmt_ts(ts: str | None) -> str:
@@ -169,6 +183,36 @@ def init(directory: str, author_type: str, author_name: str | None, no_commit: b
 
     repo = Repo.init(root, author_type=author_type, author_name=author_name or "memdrift")
     click.echo(f"{click.style('initialized', fg='green')} {root}")
+    # Say it out loud: creating the store is what declared the space, and a
+    # permission you were not told about is one you cannot reason about.
+    #
+    # It has to be *checked*, not assumed: `Repo.init` deliberately does not
+    # fail an otherwise-usable vault when the registry cannot be written (a
+    # locked-down HOME, a read-only container). Printing "(write)" after a
+    # declaration that silently failed would be a promise the very next
+    # `commit` breaks — and the human would have no idea which of the two
+    # messages to believe.
+    from . import scope
+
+    if scope.allows(root, write=True):
+        click.echo(
+            click.style(
+                f"  space: {root} (write) — this install may now read and write here", dim=True
+            )
+        )
+    else:
+        click.echo(
+            click.style(
+                f"  space: not recorded — future writes to {root} will be refused", fg="yellow"
+            )
+        )
+        click.echo(
+            click.style(
+                f"  fix:   memdrift space allow {root} --write\n"
+                f"  list:  {scope.registry_path()}",
+                dim=True,
+            )
+        )
 
     files = list(repo.iter_memory_files())
     if no_commit or not files:
@@ -206,7 +250,7 @@ def commit(
     as_json: bool,
 ) -> None:
     """Snapshot the directory and record a commit."""
-    repo = _open(obj["directory"])
+    repo = _open(obj["directory"], write=True)
     result = ops.commit(
         repo,
         message,
@@ -236,6 +280,88 @@ def commit(
         click.echo("    " + _inline_change(raw))
     if count > 20:
         click.echo(click.style(f"  … {count - 20} more", dim=True))
+    click.echo(
+        click.style(f"  undo: memdrift -C {repo.root} revert --commit {short(result['id'])}", dim=True)
+    )
+
+
+@main.group()
+def space() -> None:
+    """Which directories this install may read or write.
+
+    A plain install may read the directory it was started in, and nothing
+    else. Writing needs a space declared on purpose:
+
+    \b
+    memdrift init ~/my-memory                  # declares it, with write
+    memdrift space allow ~/shared/team --read  # someone else's, read-only
+    memdrift space allow ~/shared/team --write # you are allowed to change it
+    """
+
+
+@space.command("list")
+@click.option("--json", "as_json", is_flag=True)
+def space_list(as_json: bool) -> None:
+    """What this install may touch."""
+    from . import scope
+
+    declared = scope.load()
+    listing = [
+        {"path": s.path, "mode": s.mode, "added_by": s.added_by, "added_at": s.added_at}
+        for s in declared
+    ]
+    if as_json:
+        _dump({"registry": str(scope.registry_path()), "spaces": listing})
+        return
+    if not declared:
+        if scope.registry_path().exists():
+            # The file is there and empty: nothing is allowed, not even the
+            # working directory. Says so, and says how to undo it.
+            click.echo(click.style("the space list is empty — nothing is readable", fg="yellow"))
+            click.echo(click.style("  add one: memdrift space allow <path> --write", dim=True))
+            click.echo(click.style(f"  registry: {scope.registry_path()}", dim=True))
+            return
+        implicit = scope.spaces_for()[0]
+        click.echo(click.style("no spaces declared yet", fg="yellow"))
+        click.echo(f"  this install can read {implicit.path} (the directory you run it from)")
+        click.echo(click.style("  add one: memdrift space allow <path> --write", dim=True))
+        return
+    width = max(len(s["path"]) for s in listing)
+    for item in listing:
+        color = "green" if item["mode"] == "write" else "cyan"
+        click.echo(
+            f"{item['path'].ljust(width)}  {click.style(item['mode'].ljust(5), fg=color)}  "
+            + click.style(f"{item['added_by']} · {item['added_at']}", dim=True)
+        )
+    click.echo(click.style(f"  registry: {scope.registry_path()}", dim=True))
+
+
+@space.command("allow")
+@click.argument("path", type=click.Path(file_okay=False))
+@click.option("--write", "mode", flag_value="write", help="Read and write (default: read only).")
+@click.option("--read", "mode", flag_value="read", default=True, help="Read only (the default).")
+def space_allow(path: str, mode: str) -> None:
+    """Let this install touch PATH."""
+    from . import scope
+
+    try:
+        item = scope.allow(path, mode=mode)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"{click.style(item.mode, fg='green')}  {item.path}")
+    click.echo(click.style(f"  recorded in {scope.registry_path()}", dim=True))
+
+
+@space.command("deny")
+@click.argument("path", type=click.Path(file_okay=False))
+def space_deny(path: str) -> None:
+    """Forget PATH (reads and writes both stop)."""
+    from . import scope
+
+    if scope.deny(path):
+        click.echo(f"{click.style('removed', fg='green')} {Path(path).expanduser().resolve()}")
+        return
+    click.echo(click.style("not in the list", fg="yellow"))
 
 
 @main.command(name="log")
@@ -555,6 +681,114 @@ def serve(obj: dict, port: int, host: str, open_browser: bool, verbose: bool) ->
         srv.shutdown()
 
 
+def _load_gui():
+    """Resolve the web app lazily, so a missing one is a message, not a traceback.
+
+    Imported here rather than at module scope for two reasons: the CLI must
+    work in an install that has no web app at all, and a broken web app must
+    surface as itself instead of as a startup failure of every other command.
+    """
+    try:
+        gui_api = importlib.import_module("memdrift.gui.api")
+    except ModuleNotFoundError as exc:
+        if not (exc.name or "").startswith("memdrift.gui"):
+            raise
+        raise click.ClickException(
+            "the web app is missing from this install.\n"
+            "    pip install --force-reinstall memdrift\n"
+            "The parts that do not need a browser still work:\n"
+            "    memdrift serve    # read-only local view\n"
+            "    memdrift digest   # one self-contained html file"
+        ) from exc
+    return gui_api
+
+
+@main.command()
+@click.option("--port", type=int, default=7788, help="Port on 127.0.0.1.")
+@click.option("--host", default="127.0.0.1", show_default=True, help="Loopback only.")
+@click.option("--open", "open_browser", is_flag=True, help="Open the page in a browser.")
+@click.option("--verbose", is_flag=True, help="Log each request.")
+@click.pass_obj
+def ui(obj: dict, port: int, host: str, open_browser: bool, verbose: bool) -> None:
+    """The local web app: browse the history, read the evidence, undo.
+
+    Unlike ``serve`` this page can write. It commits the working tree, undoes
+    one field on one page, and undoes the commit it just made — and never on
+    the first click: the page fetches a plan, shows it, and only then offers a
+    confirm button. That is why it has its own command instead of being
+    folded into ``serve``:
+
+    \b
+    memdrift serve    # read-only, no writes in the code path
+    memdrift ui       # the same views, plus undo and commit behind a plan
+    """
+    import threading
+    import webbrowser
+
+    from .server import LoopbackOnly
+
+    gui_api = _load_gui()
+    # Read is enough to open the page: looking at someone else's vault is the
+    # whole point of a read space. Writes are refused per request, and the page
+    # says so up front instead of offering buttons that will fail.
+    repo = _open(obj["directory"])
+    try:
+        gui_api.check_host(host)
+    except LoopbackOnly as exc:
+        raise click.ClickException(f"refusing to bind {host!r}: ui is loopback only.") from exc
+
+    ready = threading.Event()
+    holder: dict = {}
+
+    def run() -> None:
+        try:
+            srv = gui_api.make_server(repo, host=host, port=port, verbose=verbose)
+        except OSError as exc:
+            holder["error"] = exc
+            ready.set()
+            return
+        holder["server"] = srv
+        ready.set()
+        try:
+            srv.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            srv.server_close()
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    ready.wait(5)
+
+    if "error" in holder:
+        raise click.ClickException(f"cannot listen on {host}:{port}: {holder['error']}")
+
+    srv = holder["server"]
+    url = gui_api.url_for(srv)
+    click.echo(f"{click.style('serving', fg='green')} {url}")
+    click.echo(
+        click.style(
+            "  loopback only · the token in the URL is required · Ctrl+C to stop",
+            fg="black",
+            dim=True,
+        )
+    )
+    click.echo(
+        click.style(
+            "  writes: commit, undo a field, undo the commit you just made — each after a plan you approve",
+            fg="black",
+            dim=True,
+        )
+    )
+    if open_browser:
+        webbrowser.open(url)
+    try:
+        while thread.is_alive():
+            thread.join(0.5)
+    except KeyboardInterrupt:
+        srv.shutdown()
+
+
 @main.command()
 @click.option("--json", "as_json", is_flag=True)
 @click.pass_obj
@@ -612,7 +846,7 @@ def revert(
     """
     from . import revert as revert_mod
 
-    repo = _open(obj["directory"])
+    repo = _open(obj["directory"], write=True)
     try:
         plans = revert_mod.plan(repo, field_name=field_name, page=page, commit_ref=commit_ref)
         result = revert_mod.execute(repo, plans, dry_run=dry_run, author_name=author)
@@ -659,6 +893,16 @@ def revert(
         click.style(f"reverted {len(result.written)} item(s)", fg="green")
         + (" as " + short(result.commit["id"]) if result.commit else "")
     )
+    if result.commit and result.commit.get("reverts"):
+        # Spelled out because the whole design rests on it: the new commit does
+        # not replace the old one, it points at it.
+        click.echo(
+            click.style(
+                f"  {short(result.commit['id'])} undoes {short(result.commit['reverts'])}"
+                f" — that commit is still in history",
+                dim=True,
+            )
+        )
 
 
 @main.command()
@@ -676,6 +920,19 @@ def mcp(obj: dict, no_quote: bool, print_config: bool) -> None:
     # initialised yet. `init` stays a deliberate human act; the server just
     # answers every read with "nothing yet" until it happens.
     repo = Repo(Path(obj["directory"]).expanduser().resolve())
+
+    # Scope is checked even without `.memgit/`: an agent editor config must not
+    # be able to point this server at a directory the operator never allowed,
+    # and "it will answer nothing until init" is not a reason to start it.
+    from . import scope
+
+    try:
+        scope.check(repo.root)
+    except scope.OutOfScope as exc:
+        # stderr: stdout is the JSON-RPC wire, and a one-line explanation is
+        # exactly what the editor's MCP log needs to show.
+        click.echo(str(exc), err=True)
+        raise SystemExit(2) from exc
 
     if print_config:
         # The command a client needs depends on how memdrift was installed.
@@ -730,5 +987,5 @@ def watch(obj: dict, debounce: float | None, once: bool) -> None:
     """Watch a memory directory and commit every burst of writes."""
     from .watcher import run as run_watcher
 
-    repo = _open(obj["directory"])
+    repo = _open(obj["directory"], write=True)
     run_watcher(repo, debounce=debounce, once=once)

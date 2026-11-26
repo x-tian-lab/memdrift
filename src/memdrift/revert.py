@@ -50,6 +50,10 @@ class Plan:
     note: str = ""
     skipped: bool = False
     reason: str = ""
+    #: The single commit this plan undoes, when there is exactly one. Carried
+    #: into the new commit as ``reverts: <id>`` so the pair stays traceable in
+    #: both directions without rewriting either.
+    origin: str = ""
 
 
 @dataclass
@@ -387,13 +391,19 @@ def plan_field(repo: Repo, path: str, field_name: str, commit_ref: str | None) -
                     reason="field is already absent; nothing to undo",
                 )
             note = f"remove (introduced by {short(origin['id'])})"
-            return Plan(path=path, field=field_name, before=current, after=None, note=note)
+            return Plan(
+                path=path, field=field_name, before=current, after=None,
+                note=note, origin=origin["id"],
+            )
         origin = touching[0]
         target = touching[1]["id"]
 
     restore = _value_at(repo, target, path, field_name)
     note = f"restore from {short(target)} (undo {short(origin['id'])})"
-    return Plan(path=path, field=field_name, before=current, after=restore, note=note)
+    return Plan(
+        path=path, field=field_name, before=current, after=restore,
+        note=note, origin=origin["id"],
+    )
 
 
 def _resolve_strict(repo: Repo, ref: str | None) -> str:
@@ -448,19 +458,30 @@ def plan_commit(repo: Repo, commit_ref: str) -> list[Plan]:
         change = Change.from_dict(raw)
         if change.op == "add":
             plans.append(
-                Plan(change.path, None, "exists", None, f"delete (was created by {short(target)})")
+                Plan(
+                    change.path, None, "exists", None,
+                    f"delete (was created by {short(target)})", origin=target,
+                )
             )
             continue
         if change.op == "rename" and change.rename_from:
             plans.append(
-                Plan(change.path, None, change.path, change.rename_from, f"rename back to {change.rename_from}")
+                Plan(
+                    change.path, None, change.path, change.rename_from,
+                    f"rename back to {change.rename_from}", origin=target,
+                )
             )
             continue
         if not change.field:
             plans.append(Plan(change.path, None, skipped=True, reason=f"cannot undo a {change.op} without a field"))
             continue
         restore = _value_at(repo, parent, change.path, change.field)
-        plans.append(Plan(change.path, change.field, change.before, restore, f"undo {short(target)}"))
+        plans.append(
+            Plan(
+                change.path, change.field, change.before, restore,
+                f"undo {short(target)}", origin=target,
+            )
+        )
     return plans
 
 
@@ -477,8 +498,22 @@ def plan(repo: Repo, *, field_name=None, page=None, commit_ref=None) -> list[Pla
 # ------------------------------------------------------------------- execution
 
 
-def execute(repo: Repo, plans: list[Plan], *, dry_run: bool = False, author_name: str | None = None) -> RevertResult:
-    """Apply the plans to disk, then record one commit. Nothing on dry_run."""
+def execute(
+    repo: Repo,
+    plans: list[Plan],
+    *,
+    dry_run: bool = False,
+    author_name: str | None = None,
+    reverts: str | None = None,
+) -> RevertResult:
+    """Apply the plans to disk, then record one commit. Nothing on dry_run.
+
+    ``reverts`` names the commit being undone. It goes into the *new* commit as
+    a forward pointer (``reverts: sha256:…``) and into its message for humans.
+    The old commit keeps its id, its tree and its place in the chain — undoing
+    is an append, never an edit, so the record of what actually happened that
+    night cannot be erased by undoing it.
+    """
     result = RevertResult(plans=plans)
     actionable = [p for p in plans if not p.skipped]
     if dry_run or not actionable:
@@ -513,24 +548,37 @@ def execute(repo: Repo, plans: list[Plan], *, dry_run: bool = False, author_name
     if not result.written:
         return result
 
-    message = _message(plans)
+    # When every actionable plan points at the same commit, that commit is
+    # what this revert undoes and the new commit should say so. When the plans
+    # came from different commits (a whole-page restore), there is no single
+    # answer, and inventing one would make the pointer lie.
+    if reverts is None:
+        origins = {p.origin for p in actionable if p.origin}
+        reverts = next(iter(origins)) if len(origins) == 1 else None
+
+    message = _message(plans, reverts)
     result.commit = commit_op(
         repo,
         message,
         evidence=["manual:memdrift revert"],
         author_type="human",
         author_name=author_name or "you",
+        reverts=reverts,
     )
     return result
 
 
-def _message(plans: list[Plan]) -> str:
+def _message(plans: list[Plan], reverts: str | None = None) -> str:
     actionable = [p for p in plans if not p.skipped]
     if len(actionable) == 1:
         item = actionable[0]
         where = f"{item.path} · {item.field}" if item.field else item.path
-        return f"revert: {where}"
-    return f"revert: {len(actionable)} change(s)"
+        base = f"revert: {where}"
+    else:
+        base = f"revert: {len(actionable)} change(s)"
+    # Both halves of the pointer: the message is what a human reads in `log`,
+    # the `reverts` field is what a machine follows.
+    return f"{base} (undoes {short(reverts)})" if reverts else base
 
 
 def describe(item: Plan) -> str:
